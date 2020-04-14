@@ -1,0 +1,7 @@
+newrt|start
+mse | 100 | -1 | xapp1:4560
+mse | 101 | -1 | xapp2:4560
+mse | 102 | -1 | xapp1,xapp2,xapp3:4560
+mse | 202 | -1 | xapp1:4560;xapp2:4560;xapp3:4560
+mse | 204 | -1 | xapp1:4560;xapp2:4560;xapp3:4560
+newrt|end
