@@ -50,6 +50,8 @@ DEPS += $(APPS:%=$(DEPDIR)/%.d)
 
 all: $(APPS)
 
+$(APPS):
+
 %: %.c $(OBJS)
 	$(CC) -o $@ $< $(CFLAGS) $(DEPFLAGS) $(LDFLAGS) $(OBJS)
 

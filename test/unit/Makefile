@@ -58,6 +58,8 @@ DEPS += $(TESTS:%=$(DEPDIR)/%.d)
 
 all: $(TESTS)
 
+$(TESTS):
+
 %: %.c $(OBJS)
 	$(CC) -o $@ $< $(CFLAGS) $(DEPFLAGS) $(LDFLAGS) $(OBJS) $(FORCE_SYM)
 

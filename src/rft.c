@@ -353,13 +353,22 @@ rmr_mbuf_t *rft_dequeue_msg( ) {
 	If no server is available, the replication is scheduled to
 	start when a server becomes available
 
-	Returns 1 if replication was scheduled, 0 in case of error
+	Returns 1 if replication was scheduled, 0 on error
+	In case of error, the errno is set as follows:
+		- EINVAL: invalid argument
+		- ENOTCONN: There is no server to replicate that command. Also, no log entry is created.
 */
 int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len ) {
 	log_entry_t *entry = NULL;
 
 	if( context == NULL || key == NULL || value == NULL ) {
 		logger_error( "unable to replicate command %d: context, key, and value need to have a value", command );
+		errno = EINVAL;
+		return 0;
+	}
+
+	if( raft_get_num_servers( ) == 1 ) {
+		errno = ENOTCONN;
 		return 0;
 	}
 
