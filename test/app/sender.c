@@ -104,8 +104,11 @@ static void mk_rt( ) {
 		return;
 	}
 
-	write( fd, contents, strlen( contents ) );
-	if( (close( fd ) < 0 ) ) {
+	if( write( fd, contents, strlen( contents ) ) == -1 ) {
+		fprintf( stderr, "[FAIL] couldn't write routing table to file %s: %s\n", fnb, strerror( errno ) );
+	}
+
+	if( close( fd ) < 0 ) {
 		fprintf( stderr, "[FAIL] couldn't close dummy route table: %s: %s\n", fnb, strerror( errno ) );
 		return;
 	}

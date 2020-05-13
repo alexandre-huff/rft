@@ -710,21 +710,30 @@ static inline log_entry_t *new_log_entry( term_t term, log_entry_type_e type, co
 		memcpy( entry->data, data, entry->dlen );
 
 		if( type == SERVER_COMMAND ) {	// server command means that this entry is an xApp replication
-			entry->clen = strlen( context );
-			entry->klen = strlen( key );
-			entry->context = strndup( context, entry->clen );
-			if( entry->context == NULL ) {
-				logger_error( "unable to allocate memory for the log's context" );
-				free( entry->data );
-				free( entry );
-				return NULL;
-			}
-			entry->key = strndup( key, entry->klen );
-			if( entry->key == NULL ) {
-				logger_error( "unable to allocate memory for the logs's key" );
-				free( entry->context );
-				free( entry->data );
-				free( entry );
+			/*
+				context and key cannot be null, otherwise we get compiler warnings to inline functions
+				Note: gcc does not inline functions if lacking the -O? argument
+				(see gcc -Wnnonul -O3)
+			*/
+			if( context && key ) {
+
+				entry->clen = strlen( context );
+				entry->klen = strlen( key );
+				entry->context = strndup( context, entry->clen );
+				if( entry->context == NULL ) {
+					logger_error( "unable to allocate memory for the log's context" );
+					free_log_entry( entry );
+					return NULL;
+				}
+				entry->key = strndup( key, entry->klen );
+				if( entry->key == NULL ) {
+					logger_error( "unable to allocate memory for the logs's key" );
+					free_log_entry( entry );
+					return NULL;
+				}
+			} else {
+				logger_error( "context and key must have a value (nil?)" );
+				free_log_entry( entry );
 				return NULL;
 			}
 

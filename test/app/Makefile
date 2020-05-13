@@ -22,7 +22,7 @@
 
 CC = gcc
 
-CFLAGS = -g -Wall -I$(INCLUDEDIR)
+CFLAGS = -g -Wall -O3 -I$(INCLUDEDIR)
 LDFLAGS = -lrmr_si -lpthread -lm
 
 # DEPFLAGS = -MMD -MP -MT $@ -MF $(DEPDIR)/$*.d

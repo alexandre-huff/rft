@@ -18,12 +18,13 @@
 */
 
 /*
-	Mnemonic:	hastable.c
+	Mnemonic:	hashtable.c
 	Abstract:	Implements a generic static hashtable using chain hashing
 
 	Date:		27 January 2020
 	Author:		Alexandre Huff
 */
+
 
 #ifndef _HASHTABLE_C
 #define _HASHTABLE_C
@@ -32,36 +33,8 @@
 #include <string.h>
 #include <errno.h>
 
+#include "hashtable.h"
 #include "logger.h"
-
-
-/*
-	Hash key type
-*/
-typedef enum hkey {
-	NUMERIC_KEY = 0,
-	STRING_KEY
-} hkey_t;
-
-/*
-	Defines a generic hashtable element accepting numeric and string keys
-*/
-typedef struct htelem {
-	struct htelem *prev;
-	struct htelem *next;
-	char *skey;			// string key
-	unsigned long nkey;	// numeric key
-	void *value;
-} htelem_t;
-
-/*
-	Defines a generic hash table that accepts numeric and string keys
-*/
-typedef struct hashtable {
-	size_t size;			// size of the hash table (use a prime number)
-	htelem_t **elem_list;	// pointer to the linked list of elements with the same hash
-	hkey_t key_type;
-} hashtable_t;
 
 
 static inline unsigned long hash_code( hkey_t key_type, const char *key, size_t size ) {

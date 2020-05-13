@@ -27,7 +27,7 @@ PREFIX = /usr/local
 
 CC = gcc
 
-CFLAGS = -g -Wall -I$(INCLUDEDIR)
+CFLAGS = -g -Wall -O3 -I$(INCLUDEDIR)
 DEPFLAGS = -MMD -MP -MT $@ -MF $(DEPDIR)/$*.d
 
 # install files

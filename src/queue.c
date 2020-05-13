@@ -31,25 +31,14 @@
 */
 
 #ifndef _QUEUE_C
-#define _QUEUE_c
+#define _QUEUE_C
 
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 
+#include "queue.h"
 #include "logger.h"
-
-typedef struct node {
-	struct node *next;
-	struct node *prev;
-	void *data;
-} node_t;
-
-typedef struct queue {
-	size_t len;
-	node_t *head;
-	node_t *tail;
-} queue_t;
 
 
 /*

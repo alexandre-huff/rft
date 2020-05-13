@@ -573,7 +573,7 @@ int is_configuration_changing( ) {
 void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigned int n_replicas ) {
 	raft_server_t *server = NULL;
 	unsigned int i;
-	unsigned int myidx;
+	unsigned int myidx = 0;
 	unsigned int count = 0;		// counter of replica servers
 
 	assert( me_self_id != NULL );
