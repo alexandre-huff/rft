@@ -79,7 +79,7 @@ void apply_rstate( const int cmd, const char *context, const char *key, const un
 			logger_warn( "unrecognized FSM command" );
 	}
 
-	logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", rep_state, context, key );
+	// logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", rep_state, context, key );
 }
 
 
@@ -99,7 +99,9 @@ int main( int argc, char **argv ) {
 	#endif
 
 	// ===== Experiment =====
-	mpl_t		*payload;				// payload received in the experiment
+	#if LOGGER_LEVEL >= LOGGER_WARN
+		mpl_t		*payload;			// payload received in the experiment
+	#endif
 	long		count = 0;				// message counter for reporting purposes
 	long		replied = 0;
 	long		retries = 0;
@@ -190,9 +192,8 @@ int main( int argc, char **argv ) {
 				case RAN1_MSG:
 				case RAN2_MSG:
 				case RAN3_MSG:
-					payload = (mpl_t *) msg->payload;
-
 					#if LOGGER_LEVEL >= LOGGER_WARN		// reseting counter when runnning a new experiment
+						payload = (mpl_t *) msg->payload;
 						if( payload->seq == 1 ) {
 							count = replied = retries = timeouts = errors = 0;
 							num_msgs = payload->num_msgs;

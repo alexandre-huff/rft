@@ -172,8 +172,8 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		.target = {'\0'}
 	};
 
-#if LOGGER_LEVEL == LOGGER_NONE
-	fprintf( stderr, "[INFO] initializing RFT library\n" );
+#if LOGGER_LEVEL < LOGGER_INFO
+	fprintf( stderr, "%lu %d/RFT [INFO] initializing RFT library\n", (unsigned long)time( NULL ), getpid( ) );
 #else
 	logger_info( "initializing RFT library" );
 #endif
@@ -242,7 +242,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 	assert( strlen( rft_id ) > 0 );
 	snprintf( me.self_id, sizeof( me.self_id ), "%s", rft_id );
 
-	logger_debug( "server_id is %s", me.self_id );
+	logger_debug( "RFT server_id: %s", me.self_id );
 
 	srand( time( NULL ) );
 
@@ -252,11 +252,11 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 	bootstrap = getenv( "RFT_BOOTSTRAP" );
 	if( bootstrap != NULL ) {
 		if( strcmp( bootstrap, rft_id ) == 0 ) {	// checks if this server is in charge of boostrapping the cluster
-			logger_info( "bootstrapping rft cluster" );
+			logger_info( "bootstrapping RFT cluster" );
 
 			snprintf( target_buf, sizeof(target_buf), "%s:%s", rft_id, listen_port );
 			if( ! raft_config_add_server( (server_id_t *) rft_id, target_buf, 0 ) ) {	// add itself to raft configuration servers
-				logger_fatal( "unable to initialize rft cluster configuration in rft_init" );
+				logger_fatal( "unable to initialize RFT cluster configuration in rft_init" );
 				exit( 1 );
 			}
 
@@ -265,7 +265,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 			strcpy( cmd_data.target, target_buf );
 			entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &cmd_data, sizeof(server_conf_cmd_data_t) );
 			if( entry == NULL ) {
-				logger_fatal( "unable to allocate log entry memory for bootstrapping rft configuration" );
+				logger_fatal( "unable to allocate log entry memory for bootstrapping RFT configuration" );
 				exit( 1 );
 			}
 			append_raft_log_entry( entry );
@@ -278,7 +278,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 	tasks = new_queue( );
 	if (tasks == NULL ) {
-		logger_fatal( "unable to initialize task queue for rft" );
+		logger_fatal( "unable to initialize the task queue for RFT" );
 		exit( 1 );
 	}
 
@@ -378,9 +378,10 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 
 	// TODO Future: will be changed, most likely when raft configuration changes
 	if( hashtable_get( ctxtab, key ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
-		if( ! hashtable_insert( ctxtab, key, (void *) &primary_replica ) )
+		if( ! hashtable_insert( ctxtab, key, (void *) &primary_replica ) ) {
 			logger_error( "unable to insert context %s in ctxtable as primary replica", context );
 			return 0;
+		}
 	}
 
 	return 1;
@@ -541,7 +542,7 @@ void send_membership_request( rmr_mbuf_t **msg ) {
 
 	rand_timeout_ms = randomize_election_timeout( );
 
-	logger_info( "discovering leader of the cluster" );
+	logger_info( "discovering the leader of the cluster" );
 
 	prior = get_raft_last_log_index( );
 
@@ -869,7 +870,7 @@ void *send_append_entries( void *raft_server ) {
 				strcpy( payload->leader_id, me.self_id );
 				payload->leader_commit = me.commit_index;
 
-				logger_debug( " sending	append entries request to %s, term: %lu, n_entries: %u, prev_log_index: %lu, prev_log_term: %lu, leader_commit: %lu",
+				logger_trace( " sending	append entries request to %s, term: %lu, n_entries: %u, prev_log_index: %lu, prev_log_term: %lu, leader_commit: %lu",
 							server->server_id, payload->term, payload->n_entries, payload->prev_log_index,
 							payload->prev_log_term, payload->leader_commit );
 
@@ -1061,7 +1062,7 @@ void *state_replication( ) {
 				pthread_mutex_lock( &replica_lock );
 				must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
 				if( replica ) {
-					logger_info( "sending	replication request to %s, n_entries: %u, bytes: %u, master_index: %lu",
+					logger_debug( "sending   replication request to %s, n_entries: %u, bytes: %u, master_index: %lu",
 								replica->server_id, request->n_entries, bytes, request->master_index );
 
 					rft_send_wh_msg( &msg, *replica->whid, REPLICATION_REQ, mlen, &replica->server_id );
@@ -1212,7 +1213,7 @@ static inline void raft_apply_log_entries( ) {
 	int cfg_change = 0;		// identifies if a new configuration is being applied
 	char wbuf[50];
 
-	logger_info( "applying raft log entries in FSM from index: %lu, to index: %lu", me.last_applied, me.commit_index );
+	logger_debug( "applying raft log entries in FSM from index: %lu, to index: %lu", me.last_applied, me.commit_index );
 
 	while( me.last_applied < me.commit_index ) {
 		entry = get_raft_log_entry( me.last_applied + 1 );
@@ -1295,7 +1296,7 @@ static inline void raft_commit_log_entries( index_t new_commit_index ) {
 		The new commit index will be greater that the raft last log index, as the later will be 0 (zero) after server restarts (in memory FSM)
 	*/
 	if( new_commit_index <= get_raft_last_log_index( ) ) {
-		logger_info( "committing raft log entries" );
+		logger_debug( "committing raft log entries" );
 
 		if( me.state == LEADER ) {
 			/*
@@ -1516,7 +1517,7 @@ void handle_replication_request( replication_request_t *request, replication_rep
 		if( request->master_index == server->replica_index ) {
 
 			if( apply_command_cb ) {	// just run callback if it was registered
-				logger_info( "applying	xapp state replication for server %s", request->server_id );
+				logger_debug( "applying  xapp state  replication for server %s", request->server_id );
 
 				for( i = 0; i < request->n_entries; i++, server->replica_index++ ) {
 					// calling registered callback
@@ -1675,7 +1676,7 @@ void *worker( ) {
 				// copying data from header to msg, memcpy cannot be used here because of unaligned data
 				appnd_entr_header_to_msg_cpy( appndtrs_hdr, req_appndtrs_msg );
 
-				logger_debug( "receiving append entries request from %s, term: %lu, n_entries: %u, prev_idx: %lu, prev_term: %lu, commit: %lu",
+				logger_trace( "receiving append entries request from %s, term: %lu, n_entries: %u, prev_idx: %lu, prev_term: %lu, commit: %lu",
 								req_appndtrs_msg->leader_id, req_appndtrs_msg->term, req_appndtrs_msg->n_entries,
 								req_appndtrs_msg->prev_log_index, req_appndtrs_msg->prev_log_term, req_appndtrs_msg->leader_commit );
 
@@ -1712,7 +1713,7 @@ void *worker( ) {
 			case APPEND_ENTRIES_REPLY:		// leader
 				reply_appndtrs_msg = (reply_append_entries_t *) msg->payload;
 
-				logger_debug( "receiving append entries reply from %s, term: %lu, last_log_index: %lu, success: %d",
+				logger_trace( "receiving append entries reply from %s, term: %lu, last_log_index: %lu, success: %d",
 								reply_appndtrs_msg->server_id, reply_appndtrs_msg->term,
 								reply_appndtrs_msg->last_log_index, reply_appndtrs_msg->success );
 
@@ -1726,7 +1727,7 @@ void *worker( ) {
 				// copying data from header to msg, memcpy cannot be used here because of unaligned data
 				repl_req_header_to_msg_cpy( rep_hdr, rep_req_msg );
 
-				logger_info( "receiving replication request from %s, n_entries: %u, bytes: %u, master_index: %lu",
+				logger_debug( "receiving replication request from %s, n_entries: %u, bytes: %u, master_index: %lu",
 								rep_req_msg->server_id, rep_req_msg->n_entries, rep_hdr->slen, rep_req_msg->master_index );
 
 
@@ -1744,7 +1745,7 @@ void *worker( ) {
 
 				handle_replication_request( rep_req_msg, rep_reply_msg );
 
-				logger_info( "replying	replication request to %s, replica_index: %lu, success: %d",
+				logger_debug( "replying  replication request to %s, replica_index: %lu, success: %d",
 								rep_req_msg->server_id, rep_reply_msg->replica_index, rep_reply_msg->success );
 
 				rft_rts_msg( &msg, REPLICATION_REPLY, sizeof( *rep_reply_msg ), &rep_reply_msg->server_id );
@@ -1759,7 +1760,7 @@ void *worker( ) {
 			case REPLICATION_REPLY:
 				rep_reply_msg = (replication_reply_t *) msg->payload;
 
-				logger_info( "receiving replication reply from %s, replica_index: %lu, success: %d",
+				logger_debug( "receiving replication reply from %s, replica_index: %lu, success: %d",
 							rep_reply_msg->server_id, rep_reply_msg->replica_index, rep_reply_msg->success );
 
 				handle_replication_reply( rep_reply_msg );

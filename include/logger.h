@@ -95,13 +95,13 @@
 #endif
 
 #if LOGGER_LEVEL >= LOGGER_INFO
-#define logger_info(message, args...) logger_log(LOGGER_INFO,	__FILE__, __LINE__, message "\n", ## args)
+#define logger_info(message, args...) logger_log(LOGGER_INFO, __FILE__, __LINE__, message "\n", ## args)
 #else
 #define logger_info(message, args...)
 #endif
 
 #if LOGGER_LEVEL >= LOGGER_WARN
-#define logger_warn(message, args...) logger_log(LOGGER_WARN,	__FILE__, __LINE__, message "\n", ## args)
+#define logger_warn(message, args...) logger_log(LOGGER_WARN, __FILE__, __LINE__, message "\n", ## args)
 #else
 #define logger_warn(message, args...)
 #endif
@@ -117,6 +117,8 @@
 #else
 #define logger_fatal(message, args...)
 #endif
+
+#define logger_force(level, message, args...) logger_log(level, __FILE__, __LINE__, message "\n", ## args)
 
 void logger_log(int level, const char *file, int line, const char *fmt, ...);
 

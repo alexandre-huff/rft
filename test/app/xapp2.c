@@ -110,8 +110,11 @@ void apply_rstate( const int cmd, const char *context, const char *key, const un
 
 void *listener( void *mrc ) {
 	rmr_mbuf_t	*msg = NULL;
-	mpl_t		*payload;
 	int			rts_count;
+
+	#if LOGGER_LEVEL >= LOGGER_ERROR
+		mpl_t		*payload;
+	#endif
 
 	#if LOGGER_LEVEL >= LOGGER_WARN
 		unsigned char target[RMR_MAX_SRC];
@@ -141,7 +144,9 @@ void *listener( void *mrc ) {
 				case RAN1_MSG:
 				case RAN2_MSG:
 				case RAN3_MSG:
-					payload = (mpl_t *) msg->payload;
+					#if LOGGER_LEVEL >= LOGGER_ERROR
+						payload = (mpl_t *) msg->payload;
+					#endif
 
 					#ifndef NORFT
 					rft_replicate( SET_RSTATE, "UE_RAN_Element", "UE_Counter", (unsigned char *) &count, sizeof(long) );

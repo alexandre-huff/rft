@@ -147,7 +147,7 @@ raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, ind
 	}
 
 	// if we got here, raft server is a new one
-	logger_info( "adding server %s in raft configuration as NON_VOTING_MEMBER", *server_id );
+	logger_debug( "adding server %s in raft configuration as NON_VOTING_MEMBER", *server_id );
 
 	server = (raft_server_t *) malloc( sizeof( raft_server_t ) );
 	if ( server == NULL ) {
@@ -220,7 +220,7 @@ void raft_config_remove_server( server_id_t *server_id ) {
 
 	if( server != NULL ) {
 
-		logger_info( "removing server %s from raft configuration", server_id );
+		logger_debug( "removing server %s from raft configuration", server_id );
 
 		// just ensuring that the removed server won't be accounted for votes after removal
 		if( server->status == VOTING_MEMBER ) {
@@ -294,11 +294,11 @@ static inline void set_server_voting_status( raft_server_t *server, raft_voting_
 	if( status == VOTING_MEMBER ) {
 		assert( config.voting_members < config.size );
 		config.voting_members++;
-		logger_info( "changed status of raft server %s to VOTING_MEMBER", server->server_id );
+		logger_debug( "changed status of raft server %s to VOTING_MEMBER", server->server_id );
 	} else {
 		assert( config.voting_members > 0 );
 		config.voting_members--;
-		logger_info( "changed status of raft server %s to NON_VOTING_MEMBER", server->server_id );
+		logger_debug( "changed status of raft server %s to NON_VOTING_MEMBER", server->server_id );
 	}
 }
 
@@ -616,7 +616,7 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 	}
 
 	/* temporary code, should be removed soon */
-#if LOGGER_LEVEL >= LOGGER_INFO
+#if LOGGER_LEVEL >= LOGGER_DEBUG
 	char wbuf[2048], sbuf[128];
 
 	snprintf( wbuf, 2, "|");
@@ -626,7 +626,7 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 		strncat( wbuf, sbuf, sizeof(wbuf) - strlen( wbuf ) - 1 );
 
 	}
-	logger_info( "array of servers: %s", wbuf );
+	logger_debug( "array of servers: %s", wbuf );
 
 	snprintf( wbuf, 2, "|");
 	for( i = 0; i < replicas->len; i++ ) {
@@ -634,7 +634,7 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 		strncat( wbuf, sbuf, sizeof(wbuf) - strlen( wbuf ) - 1 );
 	}
 	if( i )
-		logger_info( "replica  servers: %s", wbuf );
+		logger_debug( "replica  servers: %s", wbuf );
 #endif
 	/* temporary code up to here */
 
