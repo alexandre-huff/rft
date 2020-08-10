@@ -112,7 +112,6 @@ int main( int argc, char** argv ) {
 	int			ai = 1;						// arg index
 	long		i;
 	int			listen_port = 0;			// the port we open for "backhaul" connections
-	int			rand_port = 0;				// sets and causes us to generate a random listen port
 	int			max_retries = 1;			// number of RMR retries before giving up sending message (RMR_ERR_RETRY)
 	int			rtt = 0;					// defines if rtt timestamp records will be saved in a file
 	char		wbuf[128];					// short writing buffer
@@ -190,20 +189,15 @@ int main( int argc, char** argv ) {
 					filename = argv[ai];
 					break;
 
-				case 'l':					// generate random listen port
-					rand_port = 1;
-					break;
-
 				case 's':					// saves all RTT timestamps in a file
 					rtt = 1;
 					break;
 
 				default:
-					fprintf( stderr, "\nUsage: %s [-p listen port] [-n send msgs] [-m mtype] [-i interval nsec] [-t reply timeout ms]"
+					fprintf( stderr, "\nUsage: %s [-n send msgs] [-m mtype] [-p listen port] [-i interval nsec] [-t reply timeout ms]"
 									 " [-r retry attempts] [-g rt targets] [-o output filename] [-s] [-l]\n", argv[0] );
 					fprintf( stderr, "\t\tOptions:\n" );
 					fprintf( stderr, "\t\t[-s] saves all reply RTT records in the output file (-o is required)\n" );
-					fprintf( stderr, "\t\t[-l] generates and uses a random listen port (-p has precedence)\n" );
 					fprintf( stderr, "\t\t[-g] waits replies for the specified number of targets (each receives the same msg copy)\n\n" );
 					exit( 1 );
 			}
@@ -235,12 +229,8 @@ int main( int argc, char** argv ) {
 
 	if( listen_port ) {
 		snprintf( wbuf, sizeof( wbuf ), "%d", listen_port );
-
-	} else if( rand_port ) {
-		snprintf( wbuf, sizeof(wbuf), "%d", 43000 + ( rand() % 1000) );			// random listen port
-
 	} else {
-		snprintf( wbuf, sizeof( wbuf ), "4560");		// default port
+		snprintf( wbuf, sizeof(wbuf), "%d", 43000 + ( rand() % 1000) );			// random listen port
 	}
 
 	if( getenv( "RMR_SEED_RT" ) == NULL )
