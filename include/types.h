@@ -103,9 +103,9 @@ typedef enum replication_type {
 } replication_type_e;
 
 /*
-	Defines the particular state for the current server instance (me)
+	Defines the particular RAFT state for the current server instance (me)
 */
-typedef struct me {
+typedef struct raft_state {
 	int	state;				// Role playing by this server (LEADER, CANDIDATE, FOLLOWER, INIT_SERVER)
 	term_t current_term;	// Persistent latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	/*
@@ -125,13 +125,15 @@ typedef struct me {
 		volatile index of highest log entry applied to state machine (entries must be committed before applying to state machine)
 	*/
 	index_t last_applied;
-} server_state_t;
+} raft_state_t;
 
 /*
-	Defines the common information for all the other cluster members
+	Defines common information for all cluster members
 */
-typedef struct raft_server {
+typedef struct server {
 	server_id_t server_id;
+
+	/* ============= RAFT-specific from here ============= */
 	char target[RMR_MAX_SRC];		// the source:port address from that server used to send AppendEntries messages by wormholes
 	raft_voting_member_e status;	// defines if votes of this server are accounted for the majority (changed when processed by FSM)
 	/*
@@ -148,32 +150,36 @@ typedef struct raft_server {
 	server_active_status_e active;
 	struct timespec replied_ts;		// identifies the replied timestamp used to determine if the NON_VOTING server is caught-up with the leader
 	int hb_timeouts;		// counter of the number of heartbeat timeouts that a server did not reply for append entries (fault detection)
+	/* ============= RAFT-specific up to here ============= */
 
 	/*	============= added after version 0.1 for xapp state replication =============	*/
 
 	/*
-		index of highest xapp state (log) known to be replicated in this server (initialized to 0, increases monotonically)
-		used for the sender xapp to know the next index that must be replicated (returned by replication reply from a replica)
-		(used by the backup replica i.e. receiver)
+		index of highest xapp's log entry known to be replicated in this server (initialized to 0, increases monotonically)
+		(it is the xapp's last log index stored in the backup replica i.e. receiver -- used by the backup)
 	*/
 	index_t replica_index;
-	index_t master_index;	// index of the last log entry sent to that server (used by the primary replica i.e. sender) initialized to 0
+	/*
+		index of the xapp's last log entry sent to this server, initialized to 0
+		(it is the xapp's last log index stored in the primary server i.e. sender -- used by the primary)
+	*/
+	index_t master_index;
 	rmr_whid_t *whid;		// wormhole id used to send replication requests (initilized by the server's thread)
-} raft_server_t;
+} server_t;
 
 /*
 	Defines the raft configuration, by holding the total of servers which are part of the cluster
 	and also the total of voting members
 */
 typedef struct config {
-	unsigned int size;			// defines the total size of the cluster, including voting and non-voting members
-	unsigned int voting_members; // defines the total of voters in the cluster
+	unsigned int size;				// defines the total size of the cluster, including voting and non-voting members
+	unsigned int voting_members;	// defines the total of voters in the cluster
 	/*
 		defines if a cluster configuration (add/rm) is changing (only one at a time is allowed)
 		starts by appending entry to the log, and finishes when commit it (only then it is safe to start a new configuration)
 	*/
 	int is_changing;			 // defines if a configuration is on the way
-	raft_server_t **servers;	 // array of servers in the cluster
+	server_t **servers;			 // array of servers in the cluster
 } raft_config_t;
 
 /*
@@ -261,7 +267,7 @@ typedef struct reply_append_entries {
 */
 typedef struct replicas {
 	unsigned int len;		// defines the number of replicas in the array (array may be greater than len)
-	raft_server_t **servers;
+	server_t **servers;
 } replicas_t;
 
 /*

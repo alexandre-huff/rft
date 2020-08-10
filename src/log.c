@@ -235,7 +235,7 @@ void append_server_log_entry( log_entry_t *log_entry, server_id_t *server_id ) {
 
 	Returns 1 if conflicting log entries were removed, 0 otherwise
 */
-int remove_raft_conflicting_entries( index_t from_index, server_state_t *me ) {
+int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
 	/*
 		There wont have conflicts in server (xApp) state replication (Only primary stores log entries)
 		Thus, there is no need to write another function to remove server conflicting entries
@@ -251,7 +251,7 @@ int remove_raft_conflicting_entries( index_t from_index, server_state_t *me ) {
 		The commitIndex increases monotonically (see fig 2 raft paper)
 	*/
 	if( ( from_index > 0 ) && ( from_index > me->commit_index ) ) {
-		logger_info( "removing all conflicting log entries from raft index %lu", from_index );
+		logger_debug( "removing all conflicting log entries from raft index %lu", from_index );
 
 		from_index--;
 

@@ -41,6 +41,8 @@
 
 #include "app.h"
 
+#define MAX_RCV_BYTES 128000
+
 // commands for the state machine
 enum commands {
 	SET_RSTATE,
@@ -141,7 +143,7 @@ int main( int argc, char **argv ) {
 	if( ! listen_port )
 		listen_port = "4560";
 
-	mrc = rmr_init( listen_port, RMR_MAX_RCV_BYTES, RMRFL_NONE );
+	mrc = rmr_init( listen_port, MAX_RCV_BYTES, RMRFL_NONE );
 	if( mrc == NULL ) {
 		logger_fatal( "unable to initialize RMR" );
 		exit( 1 );
@@ -163,7 +165,7 @@ int main( int argc, char **argv ) {
 	}
 
 	#ifndef NORFT
-	rft_init( mrc, listen_port, RMR_MAX_RCV_BYTES, apply_rstate );
+	rft_init( mrc, listen_port, MAX_RCV_BYTES, apply_rstate );
 	#endif
 
 	logger_info( "listening on port %s", listen_port );

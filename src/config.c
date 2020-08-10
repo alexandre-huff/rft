@@ -80,7 +80,7 @@ unsigned int raft_get_num_servers( ) {
 	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the
 	configuration lock
 */
-static inline raft_server_t *get_server( server_id_t *server_id ) {
+static inline server_t *get_server( server_id_t *server_id ) {
 	unsigned int i;
 	assert( server_id != NULL );
 
@@ -96,8 +96,8 @@ static inline raft_server_t *get_server( server_id_t *server_id ) {
 
 	Returns the server pointer if found, NULL otherwise
 */
-raft_server_t *raft_config_get_server( server_id_t *server_id ) {
-	raft_server_t *server = NULL;
+server_t *raft_config_get_server( server_id_t *server_id ) {
+	server_t *server = NULL;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -117,9 +117,9 @@ raft_server_t *raft_config_get_server( server_id_t *server_id ) {
 	Returns a pointer to the new server, NULL if server_id was added in a previous call or could not be created
 	if server's thread is not created, server is removed from configuration
 */
-raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
+server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
 	int ret;
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 
 	if( target == NULL ) {
 		logger_error( "invalid target: null?" );
@@ -149,7 +149,7 @@ raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, ind
 	// if we got here, raft server is a new one
 	logger_debug( "adding server %s in raft configuration as NON_VOTING_MEMBER", *server_id );
 
-	server = (raft_server_t *) malloc( sizeof( raft_server_t ) );
+	server = (server_t *) malloc( sizeof( server_t ) );
 	if ( server == NULL ) {
 		logger_fatal( "unable to allocate memory for a new raft_server: %s", strerror( errno ) );
 		exit( 1 );
@@ -160,7 +160,7 @@ raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, ind
 		However, it allows to take advantage of processor's cache to iterate over the array to search for a server/data
 		Linked List would have a lot of cache miss
 	*/
-	config.servers = (raft_server_t **) realloc( config.servers, sizeof( raft_server_t** ) * ( config.size + 1 ) );
+	config.servers = (server_t **) realloc( config.servers, sizeof( server_t** ) * ( config.size + 1 ) );
 	if( config.servers == NULL ) {
 		logger_fatal( "unable to allocate memory for the server configuration array: %s", strerror( errno ) );
 		exit( 1 );
@@ -212,7 +212,7 @@ raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, ind
 */
 void raft_config_remove_server( server_id_t *server_id ) {
 	unsigned int i;
-	raft_server_t *server;
+	server_t *server;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -255,7 +255,7 @@ void raft_config_remove_server( server_id_t *server_id ) {
 			However, this approach allows take advantage of processor's cache to iterate over the array to search the servers' pointer
 			Linked List would have a lot of cache miss
 		*/
-		memmove( &config.servers[i], &config.servers[i + 1], sizeof( raft_server_t** ) * ( config.size - i - 1 ) );
+		memmove( &config.servers[i], &config.servers[i + 1], sizeof( server_t** ) * ( config.size - i - 1 ) );
 
 		config.size--;
 
@@ -264,7 +264,7 @@ void raft_config_remove_server( server_id_t *server_id ) {
 			However, this approach allows take advantage of processor's cache to iterate over the array to search the servers' pointer
 			Linked List would have a lot of cache miss
 		*/
-		config.servers = (raft_server_t **) realloc( config.servers, sizeof( raft_server_t** ) * config.size );
+		config.servers = (server_t **) realloc( config.servers, sizeof( server_t** ) * config.size );
 
 		if( ( config.servers == NULL ) && ( config.size > 0 ) ) {
 			logger_fatal( "unable to shrink memory from the server configuration array" );
@@ -288,7 +288,7 @@ void raft_config_remove_server( server_id_t *server_id ) {
 	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the
 	configuration lock
 */
-static inline void set_server_voting_status( raft_server_t *server, raft_voting_member_e status ) {
+static inline void set_server_voting_status( server_t *server, raft_voting_member_e status ) {
 	server->status = status;
 
 	if( status == VOTING_MEMBER ) {
@@ -313,7 +313,7 @@ static inline void set_server_voting_status( raft_server_t *server, raft_voting_
 */
 int raft_config_set_new_vote( server_id_t *server_id ) {
 	int is_new_vote = 0;
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -343,7 +343,7 @@ int raft_config_set_server_status( server_id_t *server_id, raft_voting_member_e 
 		configuration lock, and lock it again on the next function in this same module
 	*/
 	int changed = 0;
-	raft_server_t *server;
+	server_t *server;
 
 	if( status != NON_VOTING_MEMBER && status != VOTING_MEMBER ) {
 		logger_error( "invalid raft voting member status" );
@@ -401,7 +401,7 @@ int has_majority_of_match_index( index_t match_index ) {
 	int has_majority;
 	unsigned int i;
 	unsigned int count = 0;
-	raft_server_t *server;
+	server_t *server;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -436,7 +436,7 @@ int has_majority_of_match_index( index_t match_index ) {
 */
 void raft_config_reset_votes( ) {
 	unsigned int i;
-	raft_server_t **server;
+	server_t **server;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -455,7 +455,7 @@ void raft_config_reset_votes( ) {
 */
 void raft_config_set_all_server_indexes( index_t raft_last_log_index ) {
 	unsigned int i;
-	raft_server_t **server;
+	server_t **server;
 
 	pthread_mutex_lock( &config_lock );
 
@@ -486,7 +486,7 @@ void raft_config_set_all_server_indexes( index_t raft_last_log_index ) {
 
 	Returns 1 if server is caught-up, 0 otherwise
 */
-int is_server_caught_up( raft_server_t *server, int *rounds, struct timespec *heartbeat_timeout, int *progress ) {
+int is_server_caught_up( server_t *server, int *rounds, struct timespec *heartbeat_timeout, int *progress ) {
 
 	(*rounds)--;
 	if( timespec_cmp( server->replied_ts, *heartbeat_timeout, > ) ) {
@@ -571,7 +571,7 @@ int is_configuration_changing( ) {
 	IMPORTANT: all servers run this function when applying raft configuration
 */
 void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigned int n_replicas ) {
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 	unsigned int i;
 	unsigned int myidx = 0;
 	unsigned int count = 0;		// counter of replica servers
@@ -587,7 +587,7 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 	// if only one server, there is no replica (this happens when bootstraping the cluster)
 	if( config.size > 1 && n_replicas ) {	// n_replicas = 0 would break our code with segfault on replica servers array
 
-		replicas->servers = (raft_server_t **) realloc( replicas->servers, n_replicas * sizeof( raft_server_t **) );
+		replicas->servers = (server_t **) realloc( replicas->servers, n_replicas * sizeof( server_t **) );
 		if( replicas->servers == NULL ) {
 			logger_fatal( "unable to reallocate memory for replica servers" );
 			exit( 1 );

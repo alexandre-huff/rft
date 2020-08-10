@@ -46,7 +46,7 @@
 
 void *send_append_entries( void *raft_server );
 void handle_membership_request( membership_request_t *membership_msg, char *rmr_src );
-server_state_t *get_me( );
+raft_state_t *get_me( );
 server_id_t *get_myself_id( );
 void set_mrc( void *_mrc );
 

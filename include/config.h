@@ -31,16 +31,16 @@
 #include "types.h"
 
 raft_config_t *raft_get_config( );
-raft_server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index );
+server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index );
 void raft_config_remove_server( server_id_t *server_id );
-raft_server_t *raft_config_get_server( server_id_t *server_id );
+server_t *raft_config_get_server( server_id_t *server_id );
 int has_majority_of_votes( unsigned int rcv_votes );
 void raft_config_reset_votes( );
 int raft_config_set_new_vote( server_id_t *server_id );
 int raft_config_set_server_status( server_id_t *server_id, raft_voting_member_e status );
 void raft_config_set_all_server_indexes( index_t raft_last_log_index );
 int has_majority_of_match_index( index_t match_index );
-int is_server_caught_up( raft_server_t *server, int *rounds, struct timespec *heartbeat_timeout, int *progress );
+int is_server_caught_up( server_t *server, int *rounds, struct timespec *heartbeat_timeout, int *progress );
 int set_configuration_changing( int is_changing );
 int is_configuration_changing( );
 void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigned int n_replicas );

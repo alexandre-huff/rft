@@ -50,7 +50,7 @@ unsigned int max_entries = 130;	// the default number of entries that this test 
 
 log_entries_t *log_entries = NULL;
 
-server_state_t *me = NULL;
+raft_state_t *me = NULL;
 
 
 static void mk_rt( ) {

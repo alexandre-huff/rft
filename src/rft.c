@@ -74,21 +74,21 @@ int rand_timeout_ms;				// defines the current election timeout in ms
 	In case of deadlocks check man page of pthread_mutex_lock looking at PTHREAD_MUTEX_ERRORCHECK
 */
 pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t server_state_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t raft_state_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t election_timeout_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t follower_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t leader_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t replica_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_cond_t	tasks_cond = PTHREAD_COND_INITIALIZER;
-pthread_cond_t	server_state_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t	raft_state_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	election_timeout_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	follower_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	leader_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	replica_cond = PTHREAD_COND_INITIALIZER;
 
 
-static server_state_t me = {	// defines this server state, shared among all threads
+static raft_state_t me = {	// defines this RAFT server state, shared among all threads
 	.state = INIT_SERVER,
 	.current_term = 0L,
 	.self_id = {'\0'},
@@ -109,13 +109,13 @@ pthread_t	replication_th;				// thread id for state replication
 static replication_type_e repl_type;	// replication type based on the RFT_REPLICA_SERVERS environmet variable
 static unsigned int num_replicas;		// stores the number of replica servers to replicate the xApp's state
 static int rep_intvl;					// defines the replication interval for the xApp's state
-static raft_server_t *replica = NULL;	// defines which current replicas this server is replicating its xapp's state
+static server_t *replica = NULL;		// defines which current replicas this server is replicating its xapp's state
 static replicas_t replica_servers = {	// set of servers that will be used to replicate the xApp's state
 	.len = 0,
 	.servers = NULL
 };
 
-static hashtable_t *ctxtab = NULL;	// hastable used to store if this xApp instance is the Primary or Backup of a context
+static hashtable_t *ctxtab = NULL;	// hastable used to store if this xApp instance is the Primary or the Backup of a context
 
 /*
 	stores the maximum msg size (in bytes) that RMR is able to receive
@@ -132,7 +132,7 @@ apply_state_cb_t apply_command_cb;
 /*
 	Only used for testing purposes, should not be into the public rft.h header
 */
-server_state_t *get_me( ) {
+raft_state_t *get_me( ) {
 	return &me;
 }
 
@@ -546,7 +546,7 @@ void send_membership_request( rmr_mbuf_t **msg ) {
 
 	prior = get_raft_last_log_index( );
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	while( me.state == INIT_SERVER ) {
 
@@ -566,16 +566,16 @@ void send_membership_request( rmr_mbuf_t **msg ) {
 		timespec_get( &timeout, TIME_UTC);
 		timespec_add_ms( timeout, rand_timeout_ms );
 
-		pthread_cond_timedwait( &server_state_cond, &server_state_lock, &timeout );
+		pthread_cond_timedwait( &raft_state_cond, &raft_state_lock, &timeout );
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 /*
 	Steps down a leader or candidate to a follower state
 
-	Assumes that server_state_lock mutex is locked by the caller
+	Assumes that raft_state_lock mutex is locked by the caller
 */
 void become_follower( ) {
 	logger_info( "becoming FOLLOWER" );
@@ -597,7 +597,7 @@ void become_candidate( rmr_mbuf_t **msg ) {
 		exit( 1 );
 	}
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	logger_info( "becoming CANDIDATE" );
 
@@ -642,19 +642,19 @@ void become_candidate( rmr_mbuf_t **msg ) {
 			logger_debug( "sending vote request term: %lu", req_vote_msg->term );
 			rft_send_msg( msg, VOTE_REQ, sizeof( *req_vote_msg ) );
 
-			pthread_cond_timedwait( &server_state_cond, &server_state_lock, &election_timeout );
+			pthread_cond_timedwait( &raft_state_cond, &raft_state_lock, &election_timeout );
 		}
 
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 
 /*
 	Initializes the leader
 
-	Assumes that server_state_lock mutex is locked by the caller
+	Assumes that raft_state_lock mutex is locked by the caller
 
 	NOTE: There is no one specific leader thread, it is implemented by threads that send appendEntries to their
 		  corresponding servers in the cluster.
@@ -700,7 +700,7 @@ void become_leader( ) {
 		E_TERMS_MATCH	if terms match
 		E_OUTDATED_TERM	if term > currentTerm
 
-	Not thread-safe, assumes that calling owns server_state_lock
+	Not thread-safe, assumes that calling owns raft_state_lock
 */
 term_match_e match_terms( term_t term ) {
 	if ( term < me.current_term )
@@ -728,7 +728,7 @@ term_match_e match_terms( term_t term ) {
 /*
 	Implements a thread for each raft server in the configuration
 
-	Acquires server_state_lock
+	Acquires raft_state_lock
 */
 void *send_append_entries( void *raft_server ) {
 	unsigned int i;	// general counter used to iterate over the replica_servers array
@@ -756,7 +756,7 @@ void *send_append_entries( void *raft_server ) {
 	};
 
 	assert( raft_server != NULL);
-	raft_server_t *server = (raft_server_t *) raft_server;
+	server_t *server = (server_t *) raft_server;
 
 	server->heartbeat_cond = &heartbeat_cond;	// this thread needs to be awaked upon receiving an append reply with success = 0
 	server->leader_cond = &leader_cond;	// this thread needs to be awaked if not in leader state (upon deleting this server from cluster)
@@ -863,7 +863,7 @@ void *send_append_entries( void *raft_server ) {
 			if( n_entries )
 				memcpy( APND_ENTR_PAYLOAD_ADDR( msg->payload ), srlz_buf, bytes );
 
-			pthread_mutex_lock( &server_state_lock );
+			pthread_mutex_lock( &raft_state_lock );
 
 			if( me.state == LEADER ) {		// if I'm still the leader then that message can be sent to the followers
 				payload->term = me.current_term;
@@ -877,7 +877,7 @@ void *send_append_entries( void *raft_server ) {
 				rft_send_wh_msg( &msg, whid, APPEND_ENTRIES_REQ, mlen, &server->server_id );
 			}
 
-			pthread_mutex_unlock( &server_state_lock );
+			pthread_mutex_unlock( &raft_state_lock );
 
 			pthread_cond_timedwait( &heartbeat_cond, &heartbeat_lock, &next_heartbeat ); // can be awaked upon append entries reply
 
@@ -885,7 +885,7 @@ void *send_append_entries( void *raft_server ) {
 			if( ( server->status == NON_VOTING_MEMBER ) && logs_match ) {
 				if( is_server_caught_up( server, &rounds, &next_heartbeat, &progress ) ) {
 
-					pthread_mutex_lock( &server_state_lock );
+					pthread_mutex_lock( &raft_state_lock );
 					if( me.state == LEADER ) {
 						if( set_configuration_changing( 1 ) ) {
 							// appending server configuration to the log
@@ -900,11 +900,11 @@ void *send_append_entries( void *raft_server ) {
 							append_raft_log_entry( new_entry );
 						}
 					}
-					pthread_mutex_unlock( &server_state_lock );
+					pthread_mutex_unlock( &raft_state_lock );
 				}
 			}
 
-			pthread_mutex_lock( &server_state_lock );
+			pthread_mutex_lock( &raft_state_lock );
 			if( me.state == LEADER ) {
 				server->hb_timeouts++;	// increment heartbeat timeout counter, will be set to 0 in append entries reply handler
 				if( ( server->hb_timeouts > MAX_HEARBEAT_TIMEOUTS ) && ( set_configuration_changing( 1 ) ) ) {
@@ -919,7 +919,7 @@ void *send_append_entries( void *raft_server ) {
 					append_raft_log_entry( new_entry );
 				}
 			}
-			pthread_mutex_unlock( &server_state_lock );
+			pthread_mutex_unlock( &raft_state_lock );
 
 			timespec_get( &next_heartbeat, TIME_UTC );
 			timespec_add_ms( next_heartbeat, HEARTBEAT_TIMETOUT );	// setting the next heartbeat timeout
@@ -1106,7 +1106,7 @@ void handle_vote_request( request_vote_t *req_vote_msg, reply_vote_t *reply_vote
 	timed_out = timespec_cmp( now, election_timeout, < );
 	pthread_mutex_unlock( &election_timeout_lock );
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	match = match_terms( req_vote_msg->term );
 
@@ -1142,7 +1142,7 @@ void handle_vote_request( request_vote_t *req_vote_msg, reply_vote_t *reply_vote
 
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 /*
@@ -1154,7 +1154,7 @@ void handle_vote_reply( reply_vote_t *reply_vote_msg ) {
 	term_match_e match;
 	int is_new_vote;
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	match = match_terms( reply_vote_msg->term );
 
@@ -1172,7 +1172,7 @@ void handle_vote_reply( reply_vote_t *reply_vote_msg ) {
 		}
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 /*
@@ -1183,7 +1183,7 @@ void handle_vote_reply( reply_vote_t *reply_vote_msg ) {
 */
 void handle_membership_request( membership_request_t *membership_msg, char *src_addr ) {
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	if( me.state == LEADER ) {	// Only the leader can manage membership request messages
 
@@ -1197,18 +1197,18 @@ void handle_membership_request( membership_request_t *membership_msg, char *src_
 		}
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 /*
 	Applies new commited entries sequentialy up to the me.commit_index (including it)
 
-	Not thread-safe, assumes that the caller has the lock of server_state_lock
+	Not thread-safe, assumes that the caller has the lock of raft_state_lock
 */
 static inline void raft_apply_log_entries( ) {
 	log_entry_t *entry;
 	server_conf_cmd_data_t *data;
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 	int config_myself;		// defines it the config command is for me
 	int cfg_change = 0;		// identifies if a new configuration is being applied
 	char wbuf[50];
@@ -1371,7 +1371,7 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 	assert( request_msg != NULL );
 	assert( response_msg != NULL );
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	match = match_terms( request_msg->term );
 
@@ -1448,14 +1448,14 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 
 	}
 
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 void handle_append_entries_reply( reply_append_entries_t *reply_msg ) {
 	term_match_e match;
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 
-	pthread_mutex_lock( &server_state_lock );
+	pthread_mutex_lock( &raft_state_lock );
 
 	match = match_terms( reply_msg->term );
 
@@ -1497,11 +1497,11 @@ void handle_append_entries_reply( reply_append_entries_t *reply_msg ) {
 			pthread_mutex_unlock( &server->index_lock );
 		}
 	}
-	pthread_mutex_unlock( &server_state_lock );
+	pthread_mutex_unlock( &raft_state_lock );
 }
 
 void handle_replication_request( replication_request_t *request, replication_reply_t *reply ) {
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 	unsigned int i;
 
 	assert( request != NULL );
@@ -1546,7 +1546,7 @@ void handle_replication_request( replication_request_t *request, replication_rep
 }
 
 void handle_replication_reply( replication_reply_t *reply ) {
-	raft_server_t *server = NULL;
+	server_t *server = NULL;
 
 	assert( reply != NULL );
 
@@ -1577,9 +1577,9 @@ void *trigger_election_timeout( ) {
 
 	while ( 1 ) {
 
-		pthread_mutex_lock( &server_state_lock );
+		pthread_mutex_lock( &raft_state_lock );
 		state = me.state;
-		pthread_mutex_unlock( &server_state_lock );
+		pthread_mutex_unlock( &raft_state_lock );
 
 		switch ( state ) {
 			case FOLLOWER:
@@ -1697,7 +1697,7 @@ void *worker( ) {
 
 				handle_append_entries_request( req_appndtrs_msg, reply_appndtrs_msg );
 
-				logger_debug( "replying	append entries to %s, term: %lu, last_log_index: %lu, success: %d",
+				logger_trace( "replying	append entries to %s, term: %lu, last_log_index: %lu, success: %d",
 								req_appndtrs_msg->leader_id, reply_appndtrs_msg->term,
 								reply_appndtrs_msg->last_log_index, reply_appndtrs_msg->success );
 
@@ -1783,7 +1783,7 @@ void *worker( ) {
 
 				handle_vote_request( req_vote_buf, reply_vote_msg );
 
-				logger_debug( "replying	vote request from candidate %s => term: %lu granted: %d",
+				logger_debug( "replying vote request from candidate %s => term: %lu granted: %d",
 								req_vote_buf->candidate_id, reply_vote_msg->term, reply_vote_msg->granted );
 
 				rft_rts_msg( &msg, VOTE_REPLY, sizeof( *reply_vote_msg ), &req_vote_buf->candidate_id ); // sending reply_vote_msg

@@ -42,7 +42,7 @@
 
 #include "app.h"
 
-#define MAX_RCV_BYTES 65000
+#define MAX_RCV_BYTES 128000
 
 #if LOGGER_LEVEL >= LOGGER_INFO
 	#define LOCK( mutex ) pthread_mutex_lock( mutex )
@@ -105,7 +105,7 @@ void apply_rstate( const int cmd, const char *context, const char *key, const un
 			logger_warn( "unrecognized FSM command" );
 	}
 
-	logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", rep_state, context, key );
+	// logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", rep_state, context, key );
 }
 
 void *listener( void *mrc ) {

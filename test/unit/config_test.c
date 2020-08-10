@@ -49,7 +49,7 @@
 
 long raft_servers = 3;	// tests take into account that one of this servers is "me". default = 3
 raft_config_t *config = NULL;
-server_state_t *me = NULL;
+raft_state_t *me = NULL;
 
 static void mk_rt( ) {
 	int 	fd;
@@ -112,7 +112,7 @@ void test_raft_config_remove_server( ) {
 
 void test_raft_config_get_server( ) {
 	int i;
-	raft_server_t *server;
+	server_t *server;
 	server_id_t server_id;
 	server_id_t target;
 

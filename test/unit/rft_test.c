@@ -45,7 +45,7 @@
 
 
 long raft_servers = 3;	// tests take into account that one of this servers is "me". default = 3
-server_state_t *me = NULL;
+raft_state_t *me = NULL;
 raft_config_t *raft_config = NULL;
 
 static void mk_rt( ) {
