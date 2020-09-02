@@ -46,10 +46,8 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define RING_NONE	0			/**< no flags on ring buffer. */
-#define RING_MP		(1 << 0)	/**< multi-producer ring buffer. */
-#define RING_MC		(1 << 1)	/**< multi-consumer ring buffer. */
-#define RING_EBLOCK	(1 << 2)	/**< blocks on ring empty. */
+#include "ringbuf.h"
+
 
 /*
 	Macro to add milliseconds in a timespec
@@ -63,26 +61,6 @@
 			(a).tv_nsec -= 1000000000;			\
 		}										\
 	} while (0)
-
-/**
- * @brief Defines a generic ring buffer.
- *
- * @struct ringbuf
- * @typedef ringbuf_t
- */
-typedef struct ringbuf {
-	u_int32_t head;				/**< index of the inserting point. */
-	u_int32_t tail;				/**< index of the extracting point. */
-	u_int32_t size;				/**< total size of the ring (array). */
-	u_int32_t mask;				/**< mask for index operations. */
-	int flags;					/**< configurations flags. */
-	int cond_th;				/**< counter of sleeping threads for cond. */
-	pthread_mutex_t *cond_lock;	/**< conditional variable lock (optional). */
-	pthread_cond_t *cond;		/**< conditional variable to block on empty ring (optional). */
-	pthread_mutex_t *wlock;		/**< write lock for multi-threading producers (optional). */
-	pthread_mutex_t *rlock;		/**< read lock for multi-threading consumers (optional). */
-	void **data;				/**< ring of pointers to data. */
-} ringbuf_t;
 
 
 /**
@@ -286,7 +264,7 @@ static inline u_int32_t ring_size( ringbuf_t *ring ) {
  *
  * @param ring a pointer to the ring
  * @param data a pointer to the data to store in the ring
- * @return On success, returns 1. On error, 0 is returned.
+ * @return On success, returns 1. On error, 0 is returned (ring full).
  */
 static inline int ring_insert( ringbuf_t *ring, void *data ) {
 	int ret = 1;

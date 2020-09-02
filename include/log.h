@@ -30,14 +30,15 @@
 
 #include "types.h"
 
-#define INITIAL_LOG_ENTRIES 128
+#define RAFT_LOG_SIZE	512		// size of the ring to store raft log entries (power of 2)
+#define SERVER_LOG_SIZE	131072	// size of the ring to store server (xApp) log entries (power of 2)
 
 
-log_entries_t *get_raft_log( );	// testing purposes
-xapps_logs_t *get_xapps_logs( );	// testing purposes
-log_entries_t *get_server_log( server_id_t *server_id );	// testing purposes
+int init_log( log_class_e class, u_int32_t size );
+log_entries_t *get_raft_log( );		// testing purposes
+log_entries_t *get_server_log( );	// testing purposes
 void append_raft_log_entry( log_entry_t *log_entry );
-void append_server_log_entry( log_entry_t *log_entry, server_id_t *server_id );
+void append_server_log_entry( log_entry_t *log_entry );
 log_entry_t *get_raft_log_entry( index_t log_index );
 log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id );
 index_t get_raft_last_log_index( );
@@ -47,10 +48,10 @@ void free_log_entry( log_entry_t *entry );
 unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
 										 unsigned int *buf_len, int max_msg_size );
 unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
-											unsigned int *buf_len, int max_msg_size, server_id_t *server_id );
+											unsigned int *buf_len, int max_msg_size );
 void deserialize_raft_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries );
 void deserialize_server_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries );
-int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me );
+int remove_raft_conflicting_entries( index_t from_index, index_t committed_index );
 log_entry_t *new_raft_log_entry( term_t term, log_entry_type_e type, int command, void *data, size_t len );
 log_entry_t *new_server_log_entry( const char *context, const char *key, int command, void *data, size_t len );
 

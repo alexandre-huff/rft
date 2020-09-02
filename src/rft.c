@@ -47,7 +47,7 @@
 #include "mtl.h"
 
 #include "static/hashtable.c"	// static hashtable
-#include "ringbuf.c"			// static FIFO ring buffer
+#include "static/ringbuf.c"		// static FIFO ring buffer
 
 /* ############ Prototypes ############ */
 
@@ -246,6 +246,16 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 	srand( time( NULL ) );
 
+	if( !init_log( RAFT_LOG, RAFT_LOG_SIZE ) ) {	// initilizing ring buffer to store raft logs
+		logger_fatal( "unable to initialize buffer to store Raft logs (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
+	if( !init_log( SERVER_LOG, SERVER_LOG_SIZE ) ) {	// initializing ring buffer to store xapp logs
+		logger_fatal( "unable to initialize buffer to store xApp logs (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
 	/*
 		Getting environment variable to check if rft cluster needs to be boostrapped
 	*/
@@ -357,7 +367,7 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 
 	entry = new_server_log_entry( context, key, command, value, len );
 
-	append_server_log_entry( entry, &me.self_id );
+	append_server_log_entry( entry );
 
 	// TODO Future: will be changed, most likely when raft configuration changes
 	if( hashtable_get( ctxtab, key ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
@@ -1019,8 +1029,7 @@ void *state_replication( ) {
 
 			if( n_entries ) {
 				// creating replication request
-				bytes = serialize_server_log_entries( master_index + 1, &n_entries, &srlz_buf,
-														&buf_len, max_msg_size, &me.self_id );
+				bytes = serialize_server_log_entries( master_index + 1, &n_entries, &srlz_buf, &buf_len, max_msg_size );
 
 				mlen = (int) ( sizeof( repl_req_hdr_t ) + bytes );	// getting required size for the whole message
 				if( mlen < 0 ){
@@ -1383,7 +1392,7 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 		log_entry = get_raft_log_entry( request_msg->prev_log_index );
 
 		if( get_raft_last_log_index( ) > request_msg->prev_log_index ) {	// checking for log inconsistencies
-			no_conflict = remove_raft_conflicting_entries( request_msg->prev_log_index + 1, &me );
+			no_conflict = remove_raft_conflicting_entries( request_msg->prev_log_index + 1, me.commit_index );
 		}
 
 		// last_log_index equals 0 means that the log is empty
