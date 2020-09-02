@@ -46,8 +46,8 @@
 #include "log.h"
 #include "mtl.h"
 
-#include "queue.c"		// static queue
-#include "hashtable.c"	// static hashtable
+#include "static/queue.c"		// static queue
+#include "static/hashtable.c"	// static hashtable
 
 /* ############ Prototypes ############ */
 

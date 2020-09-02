@@ -41,7 +41,7 @@
 #include "rft_private.h"
 #include "log.h"
 #include "logger.h"
-#include "../../src/hashtable.c"
+#include "../../src/static/hashtable.c"
 
 #define CMD (i % 2)
 
