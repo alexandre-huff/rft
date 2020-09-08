@@ -114,16 +114,17 @@ server_t *raft_config_get_server( server_id_t *server_id ) {
 	Leader add server cluster configuration from membership requests
 	Followers add servers in their configuration from AppendEntries messages
 
-	Returns a pointer to the new server, NULL if server_id was added in a previous call or could not be created
-	if server's thread is not created, server is removed from configuration
+	On success, returns 1. On error, 0 is returned.
+	An error means: if the server_id was added in a previous call, or the server's thread could not be created
+	if server's thread was not created, then the server is removed from configuration
 */
-server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
+int raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
 	int ret;
 	server_t *server = NULL;
 
 	if( target == NULL ) {
 		logger_error( "invalid target: null?" );
-		return NULL;
+		return 0;
 	}
 
 	pthread_mutex_lock( &config_lock );
@@ -143,7 +144,7 @@ server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t 
 		pthread_mutex_unlock( &server->index_lock );
 
 		pthread_mutex_unlock( &config_lock );
-		return NULL;
+		return 0;
 	}
 
 	// if we got here, raft server is a new one
@@ -196,12 +197,12 @@ server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t 
 		if( ret != 0 ) {
 			logger_error( "unable to create thread for server %s", server_id );
 			raft_config_remove_server( server_id );
-			return NULL;
+			return 0;
 		}
 
 	}
 
-	return server;
+	return 1;
 }
 
 /*
@@ -533,7 +534,7 @@ int set_configuration_changing( int is_changing ) {
 		config.is_changing = is_changing;
 		ret = 1;
 
-		logger_info( "membership configuration %s", is_changing ? "is in progress" : "finished" );
+		logger_info( "membership configuration %s", is_changing ? "in progress" : "finished" );
 	}
 	pthread_mutex_unlock( &config_lock );
 
@@ -611,9 +612,8 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 
 			i = (i + 1) % config.size;	// circular search
 		}
-
-		replicas->len = count;
 	}
+	replicas->len = count;
 
 	/* temporary code, should be removed soon */
 #if LOGGER_LEVEL >= LOGGER_DEBUG

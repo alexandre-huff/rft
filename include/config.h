@@ -31,7 +31,7 @@
 #include "types.h"
 
 raft_config_t *raft_get_config( );
-server_t *raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index );
+int raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index );
 void raft_config_remove_server( server_id_t *server_id );
 server_t *raft_config_get_server( server_id_t *server_id );
 int has_majority_of_votes( unsigned int rcv_votes );

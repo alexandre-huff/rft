@@ -79,6 +79,10 @@ log_entries_t *get_raft_log( ) {
 	return &raft_log;
 }
 
+xapps_logs_t *get_xapps_logs( ) {
+	return &xapps_logs;
+}
+
 /*
 	Returns a server's log pointer (xApp state replication log)
 */
@@ -162,7 +166,7 @@ void append_raft_log_entry( log_entry_t *log_entry ) {
 				it needs to be added to the servers config
 			*/
 			if( raft_config_get_server( &data->server_id ) == NULL ) {	// if not found, add it
-				if( raft_config_add_server( &data->server_id, data->target, 0 ) == NULL ) { // we can't continue running without this server
+				if( ! raft_config_add_server( &data->server_id, data->target, 0 ) ) { // we can't continue running without this server
 					logger_fatal( "unable to append a log entry with a new server configuration command" );
 					exit( 1 );
 				}
@@ -250,13 +254,13 @@ int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
 		Commited logs cannot be removed, since they likely have been applied
 		The commitIndex increases monotonically (see fig 2 raft paper)
 	*/
-	if( ( from_index > 0 ) && ( from_index > me->commit_index ) ) {
+	pthread_mutex_lock( &raft_log_lock );
+	if( ( from_index > 0 ) && ( from_index > me->commit_index ) && ( from_index <= raft_log.head ) ) {
 		logger_debug( "removing all conflicting log entries from raft index %lu", from_index );
 
 		from_index--;
 
-		pthread_mutex_lock( &raft_log_lock );
-		while( raft_log.head > from_index ) {
+		while( raft_log.head > from_index ) {	// if from_index > raft_log.head we might run into buffer overflow
 			raft_log.head--;	// pointing to the log entry that will be removed
 
 			entry = raft_log.entries[ raft_log.head ];
@@ -273,7 +277,7 @@ int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
 
 				} else if( entry->command == DEL_MEMBER ) {	// adding back the server removed server
 
-					if( raft_config_add_server( &cmd_data->server_id, cmd_data->target, 0 ) == NULL ) {
+					if( ! raft_config_add_server( &cmd_data->server_id, cmd_data->target, 0 ) ) {
 						// we can't continue running without this server
 						logger_fatal( "unable to append a log entry with a new server configuration command" );
 						exit( 1 );
@@ -292,9 +296,11 @@ int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
 		pthread_mutex_unlock( &raft_log_lock );
 		return 1;
 
-	} else {
-		logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
 	}
+	pthread_mutex_unlock( &raft_log_lock );
+
+	if( from_index > me->commit_index )
+		logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
 
 	return 0;
 }
@@ -652,8 +658,8 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 			entry->type = ntohl( raft_hdr.type );
 			entry->context = NULL;	// not used by raft replication
 			entry->key = NULL;		// not used by raft replication
-			// entry->clen = 0;		// not used by raft replication
-			// entry->klen = 0;		// not used by raft replication
+			entry->clen = 0;		// not used by raft replication but set to avoid further segfaults
+			entry->klen = 0;		// not used by raft replication but set to avoid further segfaults
 
 			dataptr = RAFT_LOG_ENTRY_PAYLOAD_ADDR( s_entries );	// pointing to the command data
 			plen = entry->dlen;		// computing the whole payload size
@@ -700,6 +706,16 @@ static inline log_entry_t *new_log_entry( term_t term, log_entry_type_e type, co
 		entry->term = term;
 		entry->type = type;
 		entry->command = command;
+		/*
+			context and key need to be initialized here to avoid potential
+			segfaults on freeing a given log entry if an error happened on
+			creating it due to incorrect arguments or insufficient memory.
+			The free log entry function relies on non-null pointers	to free
+			the corresponding pointer, which might point to an unnitialized
+			memory address.
+		*/
+		entry->context = NULL;
+		entry->key = NULL;
 		entry->dlen = len;	// need receive len+1 when using strlen() to include the \0 too
 		entry->data = (unsigned char *) malloc( entry->dlen );
 		if( entry->data == NULL ) {
@@ -719,18 +735,20 @@ static inline log_entry_t *new_log_entry( term_t term, log_entry_type_e type, co
 
 				entry->clen = strlen( context );
 				entry->klen = strlen( key );
-				entry->context = strndup( context, entry->clen );
-				if( entry->context == NULL ) {
+				if( entry->clen == 0 ) {
 					logger_error( "unable to allocate memory for the log's context" );
 					free_log_entry( entry );
 					return NULL;
 				}
-				entry->key = strndup( key, entry->klen );
-				if( entry->key == NULL ) {
+				entry->context = strndup( context, entry->clen );
+
+				if( entry->klen == 0 ) {
 					logger_error( "unable to allocate memory for the logs's key" );
 					free_log_entry( entry );
 					return NULL;
 				}
+				entry->key = strndup( key, entry->klen );
+
 			} else {
 				logger_error( "context and key must have a value (nil?)" );
 				free_log_entry( entry );
@@ -738,10 +756,8 @@ static inline log_entry_t *new_log_entry( term_t term, log_entry_type_e type, co
 			}
 
 		} else {		// if not a server command (xApp replication), it is a raft replication
-			entry->context = NULL;
-			entry->key = NULL;
-			// entry->clen = 0;	// not used by raft
-			// entry->klen = 0;	// not used by raft
+			entry->clen = 0;	// not used by raft but it is safe to initialize
+			entry->klen = 0;	// not used by raft but it is safe to initialize
 		}
 	}
 	return entry;

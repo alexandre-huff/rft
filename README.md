@@ -22,7 +22,7 @@ The leader is in charge of the xApp work assignments and
 for updating the routing rules based on those work assignments.
 
 The library can be linked with any xApp that wants
-fault-tolerance support in a similar manner as linking the xApp
+fault tolerance support in a similar manner as linking the xApp
 core with the RMR messaging library and other libraries such as SDL
 and logging.
 
@@ -56,7 +56,7 @@ The RFT library can be linked with the -lrft option using the C compiler. Howeve
 
 ### Running tests
 
-The RFT project provides some unit tests under the [test/unit](test/unit) directory. However, the existing unit tests do not offer full coverage to all the functionalities of the library yet.
+The RFT project provides unit tests under the [test/unit](test/unit) directory. The [CppUTest](https://cpputest.github.io/) framework is employed to write unit tests. Even though RFT does not yet provide full unit test coverage, new tests will be written on updating and adding features to the RFT. Eventually, the RFT will reach full unit test coverage.
 
 Contributions to the development of unit tests are really welcome!
 

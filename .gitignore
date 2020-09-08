@@ -1,0 +1,4 @@
+*.[oa]
+*~
+.build/
+test/unit/build/

@@ -1271,7 +1271,7 @@ static inline void raft_apply_log_entries( ) {
 /*
 	Commits log entries and apply them sequentially
 
-	NOTE: Not thread safe, assumes that the caller has the lock of server_state
+	NOTE: Not thread safe, assumes that the caller has the lock of raft_state
 
 	LEADER: Checks for logs that are safe to be commited
 			Commits and applies a log entry if:

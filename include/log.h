@@ -34,9 +34,12 @@
 
 
 log_entries_t *get_raft_log( );	// testing purposes
+xapps_logs_t *get_xapps_logs( );	// testing purposes
+log_entries_t *get_server_log( server_id_t *server_id );	// testing purposes
 void append_raft_log_entry( log_entry_t *log_entry );
 void append_server_log_entry( log_entry_t *log_entry, server_id_t *server_id );
 log_entry_t *get_raft_log_entry( index_t log_index );
+log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id );
 index_t get_raft_last_log_index( );
 index_t get_server_last_log_index( server_id_t *server_id );
 term_t get_raft_last_log_term( );
