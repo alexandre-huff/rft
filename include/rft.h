@@ -72,7 +72,7 @@
 typedef void (*apply_state_cb_t)(const int command, const char *context, const char *key, const unsigned char *value, const size_t len);
 
 extern void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb );
-extern void rft_enqueue_msg( rmr_mbuf_t *msg );
+extern int rft_enqueue_msg( rmr_mbuf_t *msg );
 extern int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len );
 
 #endif

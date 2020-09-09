@@ -32,7 +32,6 @@ extern "C" {
 	#include "config.h"
 }
 
-// TODO needs final review
 raft_config_t *raft_get_config( ) {
 	return (raft_config_t *)mock().actualCall(__func__)
 		.returnPointerValue();
@@ -73,7 +72,6 @@ void raft_config_reset_votes( ) {
 	mock().actualCall(__func__);
 }
 
-// TODO needs final review
 int raft_config_set_new_vote( server_id_t *server_id ) {
 	return mock().actualCall(__func__)
 		.withParameter("server_id", *server_id)
@@ -98,10 +96,9 @@ int has_majority_of_match_index( index_t match_index ) {
 		.returnIntValue();
 }
 
-// TODO needs final review
 int is_server_caught_up( server_t *server, int *rounds, struct timespec *heartbeat_timeout, int *progress ) {
 	return mock().actualCall(__func__)
-		.withParameter("server", server)
+		.withPointerParameter("server", server)
 		.withPointerParameter("rounds", rounds)
 		.withPointerParameter("heartbeat_timeout", heartbeat_timeout)
 		.withPointerParameter("progress", progress)
@@ -119,10 +116,9 @@ int is_configuration_changing( ) {
 		.returnIntValue();
 }
 
-// TODO needs final review
 void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigned int n_replicas ) {
 	mock().actualCall(__func__)
-		.withParameter("me_self_id", me_self_id)
+		.withParameter("me_self_id", *me_self_id)
 		.withPointerParameter("replicas", replicas)
 		.withParameter("n_replicas", n_replicas);
 }

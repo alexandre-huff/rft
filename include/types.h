@@ -31,6 +31,8 @@
 #include <pthread.h>
 #include <rmr/rmr.h>
 
+#include "logring.h"
+
 /*
 	Defines RFT server_id data type
 
@@ -58,6 +60,14 @@ typedef enum raft_voting_member {
 	NON_VOTING_MEMBER,	// votes are not accounted for
 	VOTING_MEMBER		// votes are accounted for
 } raft_voting_member_e;
+
+/*
+	Defines if the log is either a RAFT log or a SERVER log
+*/
+typedef enum log_type {
+	RAFT_LOG = 0,
+	SERVER_LOG
+} log_type_e;
 
 /*
 	Defines if a log entry is a raft configuration, raft regular command, or an xApp command
@@ -209,36 +219,14 @@ typedef struct log_entry {
 
 /*
 	Defines the in-memory log structure
-	Currently we are using a simple array
-	Future: could be an ring array using mod to get indexes, so we can
-			use it along with snapshots to avoid the log growing up too much
 */
 typedef struct log_entries {
-	size_t	size;			// the max number of allocated slots for the log
-	size_t	head;			// the index for the next log saved in entries (the array index)
-	log_entry_t **entries;	// array of pointers to log entries
+	index_t last_log_index;	// the index of the last log saved in entries
+	logring_t *entries;		// ring buffer pointing to the log entries
 } log_entries_t;
 
 /*
-	Defines a log stucture for a replicated server (one per server)
-	This structure stores logs replicated from other servers
-*/
-typedef struct server_log {
-	server_id_t server_id;
-	log_entries_t log;
-} server_log_t;
-
-/*
-	Array of logs to replicate the state of xapps
-	Stores log entries replicated by this xapp and received from other xapps
-*/
-typedef struct xapps_logs {
-	size_t len;
-	server_log_t *servers_logs;
-} xapps_logs_t;
-
-/*
-	Invoked by leader to replicate log entries, also used as heartbeat
+	Invoked by the leader to replicate log entries, also used as heartbeat
 	DANGER: on modifying this struct check the definition of apnd_entr_hdr_t in mtl.h
 	Do NOT use this as a network transport layer, use mtl api instead
 */

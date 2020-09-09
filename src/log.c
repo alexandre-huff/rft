@@ -36,36 +36,27 @@
 #include "utils.h"
 #include "mtl.h"
 #include "config.h"
+#include "static/logring.c"
 
-
-typedef enum log_class {
-	RAFT_LOG = 0,
-	SERVER_LOG
-} log_class_e;
 
 pthread_mutex_t raft_log_lock = PTHREAD_MUTEX_INITIALIZER;		// mutex for locking the raft_log variable
 pthread_mutex_t server_log_lock = PTHREAD_MUTEX_INITIALIZER;	// mutex for locking the xapps_log variable
 
 /*
 	This is specific for raft full synchronous replication
-	Stores log entries for the membership managent and replication based on raft algorithm
+	Stores log entries for the membership management and replication based on the raft algorithm
 */
 static log_entries_t raft_log = {
-	.size = 0,
-	.head = 0,
+	.last_log_index = 0,
 	.entries = NULL
 };
 
 /*
-	Array of logs to replicate the state of xapps
-
-	Stores log entries replicated by this xapp and received from other xapps
-
-	No mutex is being used yet
+	Stores log entries replicated by this xapp to other xapps
 */
-static xapps_logs_t xapps_logs = {
-	.len = 0,
-	.servers_logs = NULL
+static log_entries_t xapp_log = {
+	.last_log_index = 0,
+	.entries = NULL
 };
 
 /*
@@ -79,48 +70,41 @@ log_entries_t *get_raft_log( ) {
 	return &raft_log;
 }
 
-xapps_logs_t *get_xapps_logs( ) {
-	return &xapps_logs;
-}
-
 /*
+	Used only for testing purposes
+
 	Returns a server's log pointer (xApp state replication log)
+
+	Not thread-safe, assumes that the log_lock has been acquired by the caller
 */
-log_entries_t *get_server_log( server_id_t *server_id ) {
-	size_t i;
-
-	for( i = 0; i < xapps_logs.len; i++ ) {
-		if( strcmp( xapps_logs.servers_logs[i].server_id, *server_id ) == 0 ) {
-			return &xapps_logs.servers_logs[i].log;
-		}
-	}
-
-	return NULL;
+log_entries_t *get_server_log( ) {
+	return &xapp_log;
 }
 
 /*
-	Not thread-safe, assumes that the log_lock has been acquired by the caller
+	Initializes either, RAFT or SERVER log entry structures
 
-	IMPORTANT:
-	This is a generic function that allows ensure log capacity for both, raft full sync
-	replication log, and xApp state replication log
+	Returns 1 on success. On error, 0 is returned and errno is set to indicate the error.
 */
-static inline void ensure_log_size( log_entries_t *log ) {
-	assert( log != NULL );
-
-	if( log->head == log->size ) {
-		log->size *= 2;
-
-		if ( log->size == 0 )
-			log->size = INITIAL_LOG_ENTRIES;
-
-		// this causes memory likage, but we are using exit in the following, so it's ok in this case
-		log->entries = (log_entry_t **) realloc( log->entries, log->size * sizeof( log_entry_t *) );
-		if( log->entries == NULL ) {
-			logger_fatal( "unable to reallocate memory to hold new log entries" );
-			exit( 1 );
+int init_log( log_type_e type, u_int32_t size ) {
+	if( type == RAFT_LOG ) {
+		raft_log.entries = log_ring_create( size );
+		if( raft_log.entries == NULL ) {
+			return 0;	// errno is already set
 		}
+
+	} else if( type == SERVER_LOG ) {
+		xapp_log.entries = log_ring_create( size );
+		if( xapp_log.entries == NULL ) {
+			return 0;	// errno is already set
+		}
+
+	} else {
+		errno = EINVAL;	// invalid log type
+		return 0;
 	}
+
+	return 1;
 }
 
 /*
@@ -131,16 +115,14 @@ static inline void ensure_log_size( log_entries_t *log ) {
 	IMPORTANT:
 		Not thread-safe, assumes that the log's lock has been acquired by the caller if required
 */
-static inline void append_log_entry( log_entry_t *log_entry, log_entries_t *log ) {
+static inline int append_log_entry( log_entry_t *log_entry, log_entries_t *log ) {
 	assert( log_entry != NULL );
 	assert( log != NULL );
 
-	ensure_log_size( log );
+	log->last_log_index++;	// raft starts its log index at 1, so we need to add 1 here
+	log_entry->index = log->last_log_index;
 
-	log_entry->index = log->head + 1;	// raft starts its log index at 1, so we need to add 1 here
-
-	log->entries[ log->head ] = log_entry;
-	log->head++;
+	return log_ring_insert( log->entries, log_entry );
 }
 
 /*
@@ -151,10 +133,15 @@ static inline void append_log_entry( log_entry_t *log_entry, log_entries_t *log 
 void append_raft_log_entry( log_entry_t *log_entry ) {
 	server_conf_cmd_data_t *data = NULL;
 
+	assert( log_entry != NULL );
+
 	pthread_mutex_lock( &raft_log_lock );
 
-	// we had to write a wrapper for a generic append log entries, so all particularities will be kept in this module
-	append_log_entry( log_entry, &raft_log );
+	// we had to write a wrapper for a generic append log entries, so all particularities will be kept in this function
+	if( !append_log_entry( log_entry, &raft_log ) ) {
+		logger_fatal( "unable to append a new raft log entry (%s)", strerror( ENOBUFS ) );
+		exit( 1 );
+	}
 
 	if( log_entry->type == RAFT_CONFIG ) {
 		data = (server_conf_cmd_data_t *) log_entry->data;
@@ -198,38 +185,21 @@ void append_raft_log_entry( log_entry_t *log_entry ) {
 
 	Sets the log_index of the new log entry according to its position in the log
 */
-void append_server_log_entry( log_entry_t *log_entry, server_id_t *server_id ) {
-	log_entries_t *log;
+void append_server_log_entry( log_entry_t *log_entry ) {
+	assert( log_entry != NULL );
 
 	pthread_mutex_lock( &server_log_lock );
-
-	log = get_server_log( server_id );
-	if( log == NULL ) { // if not found we create it
-		logger_debug( "reallocating memory for server %s log replication", server_id );
-		xapps_logs.servers_logs = (server_log_t *)	realloc( xapps_logs.servers_logs, (xapps_logs.len + 1) * sizeof( server_log_t ) );
-		if( xapps_logs.servers_logs == NULL ) {
-			logger_fatal( "unable to reallocate memory for xapp log replication" );
-			exit( 1 );
-		}
-		strcpy( xapps_logs.servers_logs[xapps_logs.len].server_id, *server_id );
-		xapps_logs.servers_logs[xapps_logs.len].log.size = 0;
-		xapps_logs.servers_logs[xapps_logs.len].log.head = 0;
-		xapps_logs.servers_logs[xapps_logs.len].log.entries = NULL;
-
-		log = &xapps_logs.servers_logs[xapps_logs.len].log;	// we don't need to call get_server_log() here, as we already have the pointer
-
-		xapps_logs.len++;
-	}
-
 	// wrapper as same as append raft log entry
-	append_log_entry( log_entry, log );
-
+	if( !append_log_entry( log_entry, &xapp_log ) ) {
+		logger_fatal( "unable to append a new xapp log entry (%s)", strerror( ENOBUFS ) );
+		exit( 1 );
+	}
 	pthread_mutex_unlock( &server_log_lock );
 }
 
 /*
 	Removes and frees all conflicting entries starting (including) from the
-	raft conflicting index "from_index" entry up to the end of the log
+	raft conflicting index "from_index" entry up to the last committed index
 
 	NOTE: Not thread-safe, assumes that the caller has the lock of server_state
 
@@ -239,9 +209,9 @@ void append_server_log_entry( log_entry_t *log_entry, server_id_t *server_id ) {
 
 	Returns 1 if conflicting log entries were removed, 0 otherwise
 */
-int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
+int remove_raft_conflicting_entries( index_t from_index, index_t committed_index ) {
 	/*
-		There wont have conflicts in server (xApp) state replication (Only primary stores log entries)
+		There wont have conflicts in server (xApp) state replication (Only the primary stores log entries)
 		Thus, there is no need to write another function to remove server conflicting entries
 	*/
 
@@ -249,79 +219,72 @@ int remove_raft_conflicting_entries( index_t from_index, raft_state_t *me ) {
 	server_conf_cmd_data_t *cmd_data;
 
 	/*
-		Checking to avoid underflow when decrementing
-		Checking and assuring that commited indexes wont be removed from the log
-		Commited logs cannot be removed, since they likely have been applied
+		Checking and assuring that committed indexes wont be removed from the log
+		Committed logs cannot be removed, since they likely have been applied
 		The commitIndex increases monotonically (see fig 2 raft paper)
 	*/
 	pthread_mutex_lock( &raft_log_lock );
-	if( ( from_index > 0 ) && ( from_index > me->commit_index ) && ( from_index <= raft_log.head ) ) {
+	if( ( from_index > committed_index) && ( from_index <= raft_log.last_log_index ) ) {
 		logger_debug( "removing all conflicting log entries from raft index %lu", from_index );
 
-		from_index--;
+		while( raft_log.last_log_index >= from_index ) {
 
-		while( raft_log.head > from_index ) {	// if from_index > raft_log.head we might run into buffer overflow
-			raft_log.head--;	// pointing to the log entry that will be removed
+			entry = log_ring_extract_r( raft_log.entries );
+			if( entry ) {
+				raft_log.last_log_index--;	// pointing to the log entry after removal
+				/*
+					"Unfortunately, this decision does imply that a log entry for a configuration
+					change can be removed (if leadership changes); in this case, a server must be prepared to fall back
+					to the previous configuration in its log."
+					Source: raft dissertation, check at the end of section 4.1
+				*/
+				if( entry->type == RAFT_CONFIG ) {
+					cmd_data = (server_conf_cmd_data_t *) entry->data;
+					if( entry->command == ADD_MEMBER ) {		// removing the server added server
+						raft_config_remove_server( &cmd_data->server_id );
 
-			entry = raft_log.entries[ raft_log.head ];
-			/*
-				"Unfortunately, this decision does imply that a log entry for a configuration
-				change can be removed (if leadership changes); in this case, a server must be prepared to fall back
-				to the previous configuration in its log."
-				Source: raft dissertation, check at the end of section 4.1
-			*/
-			if( entry->type == RAFT_CONFIG ) {
-				cmd_data = (server_conf_cmd_data_t *) entry->data;
-				if( entry->command == ADD_MEMBER ) {		// removing the server added server
-					raft_config_remove_server( &cmd_data->server_id );
+					} else if( entry->command == DEL_MEMBER ) {	// adding back the server removed server
 
-				} else if( entry->command == DEL_MEMBER ) {	// adding back the server removed server
+						if( ! raft_config_add_server( &cmd_data->server_id, cmd_data->target, 0 ) ) {
+							// we can't continue running without this server
+							logger_fatal( "unable to append a log entry with a new server configuration command" );
+							exit( 1 );
+						}
 
-					if( ! raft_config_add_server( &cmd_data->server_id, cmd_data->target, 0 ) ) {
-						// we can't continue running without this server
-						logger_fatal( "unable to append a log entry with a new server configuration command" );
-						exit( 1 );
-					}
-
-					if( ! raft_config_set_server_status( &cmd_data->server_id, VOTING_MEMBER ) ) {
-						logger_fatal( "unable setting status VOTING_MEMBER for server %s", cmd_data->server_id );
-						exit( 1 );
+						if( ! raft_config_set_server_status( &cmd_data->server_id, VOTING_MEMBER ) ) {
+							logger_fatal( "unable setting status VOTING_MEMBER for server %s", cmd_data->server_id );
+							exit( 1 );
+						}
 					}
 				}
+
+				free_log_entry( entry );
+
+			} else {
+				pthread_mutex_unlock( &raft_log_lock );
+				logger_warn( "conflicting log entry not found, index: %lu", entry->index );
+				return 0;
 			}
-
-			free_log_entry( entry );
 		}
-
 		pthread_mutex_unlock( &raft_log_lock );
 		return 1;
-
 	}
 	pthread_mutex_unlock( &raft_log_lock );
 
-	if( from_index > me->commit_index )
-		logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
+	logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
 
 	return 0;
 }
 
 /*
 	Gets a log entry from its raft log index
-	Note: raft log index is NOT the in-memory array index
 */
 log_entry_t *get_raft_log_entry( index_t log_index ) {
 	log_entry_t *entry = NULL;
 
-	/*
-		needs to be converted from a raft log index (struct index) to an in-memory array log index
-		Since an array starts from 0 and raft log index start from 1, we just need to decrement it
-	*/
-	log_index--;
-
 	pthread_mutex_lock( &raft_log_lock );
 
-	if( ( raft_log.size > 0 ) && ( log_index < raft_log.head ) )
-		entry = raft_log.entries[ log_index ];
+	entry = log_ring_get( raft_log.entries, log_index );
 
 	pthread_mutex_unlock( &raft_log_lock );
 
@@ -330,26 +293,13 @@ log_entry_t *get_raft_log_entry( index_t log_index ) {
 
 /*
 	Gets a log entry from its server log index
-	Note: server log index is NOT the in-memory array index
 */
-log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id ) {
+log_entry_t *get_server_log_entry( index_t log_index ) {
 	log_entry_t *entry = NULL;
-	log_entries_t *log = NULL;
-
-	/*
-		needs to be converted from a server log index (struct index) to an in-memory array log index
-		Since an array starts from 0 and server log index start from 1, we just need to decrement it
-	*/
-	log_index--;
 
 	pthread_mutex_lock( &server_log_lock );
 
-	log = get_server_log( server_id );
-
-	if( log != NULL ) {
-		if( ( log->size > 0 ) && ( log_index < log->head ) )
-			entry = log->entries[ log_index ];
-	}
+	entry = log_ring_get( xapp_log.entries, log_index );
 
 	pthread_mutex_unlock( &server_log_lock );
 
@@ -358,18 +308,13 @@ log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id ) {
 
 /*
 	Returns the last index from the raft's log (including not commited)
-
-	This can also be used to return the length of the log, 0 means the log is empty
 */
 index_t get_raft_last_log_index( ) {
 	index_t index;
 
 	pthread_mutex_lock( &raft_log_lock );
 
-	if( raft_log.size > 0 )
-		index = raft_log.head;	 // as same as "log.entries[ log.head - 1 ]->index", but faster
-	else
-		index = 0;
+	index = raft_log.last_log_index;
 
 	pthread_mutex_unlock( &raft_log_lock );
 
@@ -378,19 +323,13 @@ index_t get_raft_last_log_index( ) {
 
 /*
 	Returns the last index from the servers's log
-
-	This can also be used to return the length of the log, 0 means the log is empty
 */
-index_t get_server_last_log_index( server_id_t *server_id ) {
-	log_entries_t *log = NULL;
-	size_t index = 0;
+index_t get_server_last_log_index( ) {
+	index_t index;
 
 	pthread_mutex_lock( &server_log_lock );
 
-	log = get_server_log( server_id );
-
-	if( log )
-		index = log->head;		// as same as "log.entries[ log.head - 1 ]->index", but faster
+	index = xapp_log.last_log_index;
 
 	pthread_mutex_unlock( &server_log_lock );
 
@@ -402,6 +341,7 @@ index_t get_server_last_log_index( server_id_t *server_id ) {
 	Returns the last term from the log (including not commited)
 */
 term_t get_raft_last_log_term( ) {
+	log_entry_t *entry;
 	term_t term;
 
 	/*
@@ -410,8 +350,9 @@ term_t get_raft_last_log_term( ) {
 
 	pthread_mutex_lock( &raft_log_lock );
 
-	if( raft_log.size > 0 )
-		term = raft_log.entries[ raft_log.head - 1 ]->term;
+	entry = log_ring_get( raft_log.entries, raft_log.last_log_index );
+	if( entry )
+		term = entry->term;
 	else
 		term = 0;
 
@@ -456,7 +397,7 @@ inline void free_log_entry( log_entry_t *entry ) {
 	Returns the total of serialized bytes
 */
 static inline unsigned int serialize_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
-												unsigned int *buf_len, int max_buf_len, log_entries_t *log, log_class_e class ) {
+												unsigned int *buf_len, int max_buf_len, log_entries_t *log, log_type_e type ) {
 	unsigned int bytes = 0;	 // size of the current serialization
 	unsigned int esize = 0;	 // entry size
 	unsigned int count = 0;	 // counter of the number of entries that have been serialized
@@ -465,18 +406,15 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 	server_log_entry_hdr_t server_hdr;	// server log entry with converted network byte order in header
 	unsigned char *bufptr;				// auxiliary offset pointer
 
-	/*
-		from_index needs to be converted from a raft log index (struct index) to an in-memory array log index
-		Since an array starts from 0 and raft log index start from 1, we just need to decrement it
-	*/
-	from_index--;
+	if( ( from_index - 1 + *n_entries ) <= log->last_log_index ) {	// needs decrease 1 from from_index since *n_entries counts for it
 
-	if( ( from_index + *n_entries ) <= log->head ) {
+		for( ; (count < *n_entries) && (bytes < max_buf_len) && ( max_buf_len > 0 ); from_index++, count++ ) {
 
-		for( ; (count < *n_entries) && (bytes <= max_buf_len); from_index++, count++ ) {
+			entry = log_ring_get( log->entries, from_index );
+			if( entry == NULL )
+				break;
 
-			entry = log->entries[from_index];
-			if( class == SERVER_LOG ) {
+			if( type == SERVER_LOG ) {
 				esize = SERVER_LOG_ENTRY_HDR_SIZE + entry->clen + entry->klen + entry->dlen;	// entry size = header + command
 			} else {
 				esize = RAFT_LOG_ENTRY_HDR_SIZE + entry->dlen;	// entry size = header + command
@@ -499,7 +437,7 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 
 			bufptr = *lbuf + bytes; // pointing to the next available spot
 
-			if( class == SERVER_LOG ) {
+			if( type == SERVER_LOG ) {
 				server_hdr.index = HTONLL( entry->index );
 				server_hdr.clen = htonl( entry->clen );
 				server_hdr.klen = htonl( entry->klen );
@@ -534,8 +472,8 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 							"reason: size of a log entry is greater than the RMR's max msg size" );
 
 	} else {
-		logger_fatal( "unable to serialize log entries, out of range ==> (from_index + n_entries)=%lu <= log.head=%lu",
-						from_index + *n_entries, log->head );
+		logger_fatal( "unable to serialize log entries, out of range ==> (from_index + n_entries)=%lu <= log.last_log_index=%lu",
+						from_index + *n_entries, log->last_log_index );
 		exit( 1 );
 	}
 
@@ -583,14 +521,14 @@ unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_ent
 	Returns the total of serialized bytes
 */
 unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
-											unsigned int *buf_len, int max_msg_size, server_id_t *server_id ) {
+											unsigned int *buf_len, int max_msg_size ) {
 	// this is a wrapper function
 	unsigned int bytes;
 
 	pthread_mutex_lock( &server_log_lock );
 
 	// we can only serialize RMR's max_msg_size MINUS size of the replication request mtl header
-	bytes = serialize_log_entries( from_index, n_entries, lbuf, buf_len, max_msg_size - REPL_REQ_HDR_LEN, get_server_log( server_id ), SERVER_LOG );
+	bytes = serialize_log_entries( from_index, n_entries, lbuf, buf_len, max_msg_size - REPL_REQ_HDR_LEN, &xapp_log, SERVER_LOG );
 
 	pthread_mutex_unlock( &server_log_lock );
 
@@ -604,9 +542,8 @@ unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_e
 
 	This function is generic: can be used to deserialize log entries for raft and server logs
 */
-static inline void deserialize_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries, log_class_e class ) {
+static inline void deserialize_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries, log_type_e type ) {
 	unsigned int i;
-	// unsigned int offset = 0;
 	log_entry_t *entry = NULL;
 	raft_log_entry_hdr_t raft_hdr;		// raft log entry with converted network byte order in header
 	server_log_entry_hdr_t server_hdr;	// server log entry with converted network byte order in header
@@ -614,7 +551,7 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 	size_t plen;						// auxiliary log entry to store the whole payload size
 	unsigned char *dataptr = NULL;		// auxiliary pointer to the command data
 
-	hdr_len = ( class == SERVER_LOG ? SERVER_LOG_ENTRY_HDR_SIZE : RAFT_LOG_ENTRY_HDR_SIZE );	// keeps our function more clear
+	hdr_len = ( type == SERVER_LOG ? SERVER_LOG_ENTRY_HDR_SIZE : RAFT_LOG_ENTRY_HDR_SIZE );	// keeps our function more clear
 
 	for( i = 0; i < n_entries; i++ ) {
 		entries[i] = (log_entry_t *) malloc( sizeof( log_entry_t ) );
@@ -624,7 +561,7 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 			exit( 1 );
 		}
 
-		if( class == SERVER_LOG ) { // xApp replication log entries
+		if( type == SERVER_LOG ) { // xApp replication log entries
 			memcpy( &server_hdr, s_entries, hdr_len );
 			// entry->term = 0;	 // not used by xApp replication
 			entry->index = NTOHLL( server_hdr.index) ;
@@ -673,7 +610,6 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 
 		memcpy( entry->data, dataptr, plen );
 
-		// offset += hdr_len + entry->dlen;
 		s_entries += hdr_len + plen;
 
 	}

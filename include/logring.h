@@ -17,34 +17,34 @@
 ==================================================================================
 */
 
-/*
-	Mnemonic:	queue.h
-	Abstract:	Defines header file of typedefs for a generic queue
-				using doubly linked list
+/**
+ * @file logring.h
+ *
+ * @brief Defines the structure for the Log Entries RING.
+ *
+ * @date 28 August 2020.
+ *
+ * @author Alexandre Huff
+ */
 
-	Date:		12 May 2020
-	Author:		Alexandre Huff
-*/
 
-#ifndef _QUEUE_H
-#define _QUEUE_H
+#ifndef _LOGRING_H
+#define _LOGRING_H
 
-/*
-	Defines a generic element of the queue
-*/
-typedef struct node {
-	struct node *next;
-	struct node *prev;
-	void *data;
-} node_t;
 
-/*
-	Defines the queue
-*/
-typedef struct queue {
-	size_t len;
-	node_t *head;
-	node_t *tail;
-} queue_t;
+/**
+ * @brief Defines a generic ring to store log entries.
+ *
+ * @struct logring
+ * @typedef logring_t
+ */
+typedef struct logring {
+	u_int32_t head;		/**< index of the inserting point. */
+	u_int32_t tail;		/**< index of the extracting point. */
+	u_int32_t size;		/**< total size of the ring (array). */
+	u_int32_t mask;		/**< mask for index operations. */
+	void **data;		/**< ring of pointers to data. */
+} logring_t;
+
 
 #endif

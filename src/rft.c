@@ -46,8 +46,8 @@
 #include "log.h"
 #include "mtl.h"
 
-#include "static/queue.c"		// static queue
 #include "static/hashtable.c"	// static hashtable
+#include "static/ringbuf.c"		// static FIFO ring buffer
 
 /* ############ Prototypes ############ */
 
@@ -100,11 +100,11 @@ static raft_state_t me = {	// defines this RAFT server state, shared among all t
 
 static void *mrc = NULL;				// rmr message router context
 
-static queue_t *tasks = NULL;			// queue rft messages forwarded by xapps
+static ringbuf_t *tasks = NULL;			// ring to store rft messages forwarded by xapps
 
-pthread_t	worker_th;					// thread id for the listener
-pthread_t	election_timeout_th;		// thread id for in charge of leader election timeout
-pthread_t	replication_th;				// thread id for state replication
+pthread_t worker_th;					// thread id for the listener
+pthread_t election_timeout_th;			// thread id for in charge of leader election timeout
+pthread_t replication_th;				// thread id for state replication
 
 static replication_type_e repl_type;	// replication type based on the RFT_REPLICA_SERVERS environmet variable
 static unsigned int num_replicas;		// stores the number of replica servers to replicate the xApp's state
@@ -246,6 +246,16 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 	srand( time( NULL ) );
 
+	if( !init_log( RAFT_LOG, RAFT_LOG_SIZE ) ) {	// initilizing ring buffer to store raft logs
+		logger_fatal( "unable to initialize buffer to store Raft logs (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
+	if( !init_log( SERVER_LOG, SERVER_LOG_SIZE ) ) {	// initializing ring buffer to store xapp logs
+		logger_fatal( "unable to initialize buffer to store xApp logs (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
 	/*
 		Getting environment variable to check if rft cluster needs to be boostrapped
 	*/
@@ -271,14 +281,14 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 			append_raft_log_entry( entry );
 			raft_commit_log_entries( get_raft_last_log_index( ) );	// it should be 1, calling the function just to make sure
 
-			// we need senf first message here, since at applying the first entry, this server is not the leader yet
+			// we need to send the first message here, since at applying the first entry, this server is not the leader yet
 			logger_info( "send message to routing manager ===== %s %s =====", "ADD_ROUTE", target_buf );
 		}
 	}
 
-	tasks = new_queue( );
+	tasks = ring_create( 32768, ( RING_MP | RING_EBLOCK ) ); // multi-producer and single-consumer read-blocking ring
 	if (tasks == NULL ) {
-		logger_fatal( "unable to initialize the task queue for RFT" );
+		logger_fatal( "unable to initialize the task ring buffer for RFT (%s)", strerror( errno ) );
 		exit( 1 );
 	}
 
@@ -295,57 +305,40 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 /*
 	Enqueues rft messages forwarded by xapps (producer)
+
+	On success, return 1. On error, 0 is returned and errno is set to indicate the error.
+	Possible error codes:
+		- EINVAL: invalid argument
+		- ENOMEM: memory allocation of the task failed
+		- ENOBUFS: task's ring buffer is full and rft message was not enqueued
 */
-void rft_enqueue_msg( rmr_mbuf_t *msg ) {
-	int signal = 0;
+int rft_enqueue_msg( rmr_mbuf_t *msg ) {
+	int error;
 	int plen; 	// payload length
 	rmr_mbuf_t *msg_copy = NULL;
 
 	if( msg == NULL ) {
 		logger_error( "invalid msg to enqueue: null?" );
-		return;
+		errno = EINVAL;
+		return 0;
 	}
 
 	plen = rmr_payload_size( msg );
 	msg_copy = rmr_realloc_payload( msg, plen, 1, 1 );
 	if( msg_copy == NULL ) {
-		logger_error( "unable to realloc a message copy to be enqueued: %s", strerror( errno ) );
-		return;
+		error = errno;
+		logger_error( "unable to allocate a message copy to enqueue in the ring: %s", strerror( errno ) );
+		errno = error;
+		return 0;
 	}
 
-	pthread_mutex_lock( &tasks_lock );
-
-	if ( tasks->len == 0 )		// queue was empty, so worker thread needs a signal to dequeue the message
-		signal = 1;
-
-	if( ! enqueue( tasks, msg_copy ) ) {
-		logger_fatal( "unable to enqueue rft message" );
-		exit( 1 );
+	if( ! ring_insert( tasks, msg_copy ) ) {
+		logger_warn( "unable to enqueue rft message in the ring (%s)", strerror( ENOBUFS ) );
+		errno = ENOBUFS;
+		return 0;
 	}
 
-	if ( signal )
-		pthread_cond_signal( &tasks_cond );
-
-	pthread_mutex_unlock( &tasks_lock );
-}
-
-/*
-	Dequeues rft messages consumed by rft's worker thread (consumer)
-*/
-rmr_mbuf_t *rft_dequeue_msg( ) {
-
-	rmr_mbuf_t *msg = NULL;
-
-	pthread_mutex_lock( &tasks_lock );
-
-	if ( tasks->len < 1 )		// no messages in the queue
-		pthread_cond_wait( &tasks_cond, &tasks_lock );
-
-	msg = ( rmr_mbuf_t	*) dequeue( tasks );
-
-	pthread_mutex_unlock( &tasks_lock );
-
-	return msg;
+	return 1;
 }
 
 /*
@@ -374,7 +367,7 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 
 	entry = new_server_log_entry( context, key, command, value, len );
 
-	append_server_log_entry( entry, &me.self_id );
+	append_server_log_entry( entry );
 
 	// TODO Future: will be changed, most likely when raft configuration changes
 	if( hashtable_get( ctxtab, key ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
@@ -1036,8 +1029,7 @@ void *state_replication( ) {
 
 			if( n_entries ) {
 				// creating replication request
-				bytes = serialize_server_log_entries( master_index + 1, &n_entries, &srlz_buf,
-														&buf_len, max_msg_size, &me.self_id );
+				bytes = serialize_server_log_entries( master_index + 1, &n_entries, &srlz_buf, &buf_len, max_msg_size );
 
 				mlen = (int) ( sizeof( repl_req_hdr_t ) + bytes );	// getting required size for the whole message
 				if( mlen < 0 ){
@@ -1400,7 +1392,7 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 		log_entry = get_raft_log_entry( request_msg->prev_log_index );
 
 		if( get_raft_last_log_index( ) > request_msg->prev_log_index ) {	// checking for log inconsistencies
-			no_conflict = remove_raft_conflicting_entries( request_msg->prev_log_index + 1, &me );
+			no_conflict = remove_raft_conflicting_entries( request_msg->prev_log_index + 1, me.commit_index );
 		}
 
 		// last_log_index equals 0 means that the log is empty
@@ -1663,7 +1655,7 @@ void *worker( ) {
 
 	while( 1 ) {	// This is a worker thread that processes messages enqueued by the xApp
 
-		msg = rft_dequeue_msg( );
+		msg = (rmr_mbuf_t *) ring_extract( tasks );	// Dequeues rft messages from the task ring (consumer)
 		if( msg == NULL ) {
 			logger_fatal( "unable to dequeue an RFT message on worker" );
 			exit( 1 );

@@ -126,13 +126,13 @@ static inline int hashtable_insert( hashtable_t *table, const char *key, void *v
 	htelem_t *head = NULL;
 
 	if( table == NULL ) {
-		errno = EINVAL;
 		logger_error( "table argument cannot be null to insert an element into the hashtable" );
+		errno = EINVAL;
 		return 0;
 	}
 	if( key == NULL ) {
-		errno = EINVAL;
 		logger_error( "key argument cannot be null to insert an element into the hashtable" );
+		errno = EINVAL;
 		return 0;
 	}
 
@@ -151,7 +151,8 @@ static inline int hashtable_insert( hashtable_t *table, const char *key, void *v
 
 		elem = (htelem_t *) malloc( sizeof( htelem_t ) );
 		if( elem == NULL ) {
-			logger_error( "unable to allocate a new hashtable element: %s", strerror( errno) );
+			logger_error( "unable to allocate a new hashtable element (%s)", strerror( errno ) );
+			errno = ENOMEM;
 			return 0;
 		}
 
@@ -163,6 +164,8 @@ static inline int hashtable_insert( hashtable_t *table, const char *key, void *v
 			elem->skey = strdup( key ); // returns NULL if insufficient memory
 			if( !elem->skey ) {
 				free( elem );
+				logger_error( "unable to duplicate a hashtable string key (%s)", strerror( errno ) );
+				errno = ENOMEM;
 				return 0;
 			}
 		}
@@ -239,13 +242,13 @@ static inline void *hashtable_get( hashtable_t *table, const char *key ) {
 	unsigned long hash;
 
 	if( table == NULL ) {
-		errno = EINVAL;
 		logger_error( "table argument cannot be null to get an element from hashtable" );
+		errno = EINVAL;
 		return NULL;
 	}
 	if( key == NULL ) {
-		errno = EINVAL;
 		logger_error( "key argument cannot be null to get an element from hashtable" );
+		errno = EINVAL;
 		return NULL;
 	}
 
