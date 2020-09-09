@@ -26,7 +26,7 @@
 */
 
 #include <string.h>
-#include <stdio.h>
+#include <stdlib.h>
 
 /*
 	Returns a pointer a new string which is a clone of str.

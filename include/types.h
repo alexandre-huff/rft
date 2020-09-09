@@ -64,10 +64,10 @@ typedef enum raft_voting_member {
 /*
 	Defines if the log is either a RAFT log or a SERVER log
 */
-typedef enum log_class {
+typedef enum log_type {
 	RAFT_LOG = 0,
 	SERVER_LOG
-} log_class_e;
+} log_type_e;
 
 /*
 	Defines if a log entry is a raft configuration, raft regular command, or an xApp command

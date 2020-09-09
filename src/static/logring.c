@@ -87,7 +87,7 @@ static inline logring_t *log_ring_create( u_int32_t size ) {
 		return NULL;
 	}
 
-	ring = (logring_t *) malloc( sizeof( logring_t *) );
+	ring = (logring_t *) malloc( sizeof(logring_t) );
 	if( ring == NULL )
 		return NULL;	// errno is already set
 
@@ -96,7 +96,7 @@ static inline logring_t *log_ring_create( u_int32_t size ) {
 	ring->size = size;
 	ring->mask = size - 1;
 
-	ring->data = (void **) malloc( size * sizeof(void **) );
+	ring->data = (void **) malloc( size * sizeof(void *) );
 	if( ring->data == NULL ) {
 		free( ring );	// does not change errno
 		return NULL;
@@ -182,7 +182,7 @@ static inline log_entry_t *log_ring_extract( logring_t *ring ) {
 
 	if ( ring->tail != ring->head ) {	// ring is empty when tail == head
 
-		ptr = ring->data[ring->tail];
+		ptr = (log_entry_t *) ring->data[ring->tail];
 		ring->data[ring->tail] = NULL;  // forcing to be NULL in case of trying to get an element that is out of range
 		ring->tail = ( ring->tail + 1 ) & ring->mask;
 
@@ -213,7 +213,7 @@ static inline log_entry_t *log_ring_extract_r( logring_t *ring ) {
 	if ( ring->tail != ring->head ) {	// ring is empty when tail == head
 
 		ring->head = ( ring->head - 1 ) & ring->mask;	// reverse
-		ptr = ring->data[ring->head];
+		ptr = (log_entry_t *) ring->data[ring->head];
 		ring->data[ring->head] = NULL;  // forcing to be NULL in case of trying to get an element that is out of range
 
 	}
@@ -239,7 +239,7 @@ static inline log_entry_t *log_ring_get( logring_t *ring, index_t log_index ) {
 
 	assert( ring != NULL );
 
-	ptr = ring->data[ring->tail];
+	ptr = (log_entry_t *) ring->data[ring->tail];
 	if( ptr == NULL )
 		return NULL;
 	tidx = ptr->index;
@@ -248,12 +248,12 @@ static inline log_entry_t *log_ring_get( logring_t *ring, index_t log_index ) {
 		this does not return NULL, because the head has been moved
 		forward and therefore the head will certainly have a value
 	*/
-	ptr = ring->data[(ring->head - 1) & ring->mask];
+	ptr = (log_entry_t *) ring->data[(ring->head - 1) & ring->mask];
 	hidx = ptr->index;
 
 	if( ( log_index >= tidx ) && ( log_index <= hidx )  ) {
 		offset = log_index - tidx;
-		return ring->data[ ( ring->tail + offset ) & ring->mask ];
+		return (log_entry_t *) ring->data[ ( ring->tail + offset ) & ring->mask ];
 	}
 
 	return NULL;	// log_index is out of range

@@ -29,8 +29,8 @@
 #include "rft.h"
 #include "types.h"
 
-extern void rft_enqueue_msg( rmr_mbuf_t *msg ) {
-    return;
+extern int rft_enqueue_msg( rmr_mbuf_t *msg ) {
+    return 1;
 }
 
 server_id_t *get_myself_id( ) {

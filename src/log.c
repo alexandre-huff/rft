@@ -86,21 +86,21 @@ log_entries_t *get_server_log( ) {
 
 	Returns 1 on success. On error, 0 is returned and errno is set to indicate the error.
 */
-int init_log( log_class_e class, u_int32_t size ) {
-	if( class == RAFT_LOG ) {
+int init_log( log_type_e type, u_int32_t size ) {
+	if( type == RAFT_LOG ) {
 		raft_log.entries = log_ring_create( size );
 		if( raft_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
 
-	} else if( class == SERVER_LOG ) {
+	} else if( type == SERVER_LOG ) {
 		xapp_log.entries = log_ring_create( size );
 		if( xapp_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
 
 	} else {
-		errno = EINVAL;	// invalid log class
+		errno = EINVAL;	// invalid log type
 		return 0;
 	}
 
@@ -217,17 +217,16 @@ int remove_raft_conflicting_entries( index_t from_index, index_t committed_index
 
 	log_entry_t *entry;
 	server_conf_cmd_data_t *cmd_data;
-	int removed = 1;
 
 	/*
 		Checking and assuring that committed indexes wont be removed from the log
 		Committed logs cannot be removed, since they likely have been applied
 		The commitIndex increases monotonically (see fig 2 raft paper)
 	*/
-	if( from_index > committed_index ) {
+	pthread_mutex_lock( &raft_log_lock );
+	if( ( from_index > committed_index) && ( from_index <= raft_log.last_log_index ) ) {
 		logger_debug( "removing all conflicting log entries from raft index %lu", from_index );
 
-		pthread_mutex_lock( &raft_log_lock );
 		while( raft_log.last_log_index >= from_index ) {
 
 			entry = log_ring_extract_r( raft_log.entries );
@@ -262,18 +261,19 @@ int remove_raft_conflicting_entries( index_t from_index, index_t committed_index
 				free_log_entry( entry );
 
 			} else {
+				pthread_mutex_unlock( &raft_log_lock );
 				logger_warn( "conflicting log entry not found, index: %lu", entry->index );
-				removed = 0;
+				return 0;
 			}
 		}
 		pthread_mutex_unlock( &raft_log_lock );
-
-	} else {
-		logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
-		removed = 0;
+		return 1;
 	}
+	pthread_mutex_unlock( &raft_log_lock );
 
-	return removed;
+	logger_warn( "attempt to remove committed entries from the log, some process is slow or messages are being duplicated" );
+
+	return 0;
 }
 
 /*
@@ -294,7 +294,7 @@ log_entry_t *get_raft_log_entry( index_t log_index ) {
 /*
 	Gets a log entry from its server log index
 */
-log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id ) {
+log_entry_t *get_server_log_entry( index_t log_index ) {
 	log_entry_t *entry = NULL;
 
 	pthread_mutex_lock( &server_log_lock );
@@ -324,7 +324,7 @@ index_t get_raft_last_log_index( ) {
 /*
 	Returns the last index from the servers's log
 */
-index_t get_server_last_log_index( server_id_t *server_id ) {
+index_t get_server_last_log_index( ) {
 	index_t index;
 
 	pthread_mutex_lock( &server_log_lock );
@@ -397,7 +397,7 @@ inline void free_log_entry( log_entry_t *entry ) {
 	Returns the total of serialized bytes
 */
 static inline unsigned int serialize_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
-												unsigned int *buf_len, int max_buf_len, log_entries_t *log, log_class_e class ) {
+												unsigned int *buf_len, int max_buf_len, log_entries_t *log, log_type_e type ) {
 	unsigned int bytes = 0;	 // size of the current serialization
 	unsigned int esize = 0;	 // entry size
 	unsigned int count = 0;	 // counter of the number of entries that have been serialized
@@ -408,13 +408,13 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 
 	if( ( from_index - 1 + *n_entries ) <= log->last_log_index ) {	// needs decrease 1 from from_index since *n_entries counts for it
 
-		for( ; (count < *n_entries) && (bytes <= max_buf_len); from_index++, count++ ) {
+		for( ; (count < *n_entries) && (bytes < max_buf_len) && ( max_buf_len > 0 ); from_index++, count++ ) {
 
 			entry = log_ring_get( log->entries, from_index );
 			if( entry == NULL )
 				break;
 
-			if( class == SERVER_LOG ) {
+			if( type == SERVER_LOG ) {
 				esize = SERVER_LOG_ENTRY_HDR_SIZE + entry->clen + entry->klen + entry->dlen;	// entry size = header + command
 			} else {
 				esize = RAFT_LOG_ENTRY_HDR_SIZE + entry->dlen;	// entry size = header + command
@@ -437,7 +437,7 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 
 			bufptr = *lbuf + bytes; // pointing to the next available spot
 
-			if( class == SERVER_LOG ) {
+			if( type == SERVER_LOG ) {
 				server_hdr.index = HTONLL( entry->index );
 				server_hdr.clen = htonl( entry->clen );
 				server_hdr.klen = htonl( entry->klen );
@@ -542,7 +542,7 @@ unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_e
 
 	This function is generic: can be used to deserialize log entries for raft and server logs
 */
-static inline void deserialize_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries, log_class_e class ) {
+static inline void deserialize_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries, log_type_e type ) {
 	unsigned int i;
 	log_entry_t *entry = NULL;
 	raft_log_entry_hdr_t raft_hdr;		// raft log entry with converted network byte order in header
@@ -551,7 +551,7 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 	size_t plen;						// auxiliary log entry to store the whole payload size
 	unsigned char *dataptr = NULL;		// auxiliary pointer to the command data
 
-	hdr_len = ( class == SERVER_LOG ? SERVER_LOG_ENTRY_HDR_SIZE : RAFT_LOG_ENTRY_HDR_SIZE );	// keeps our function more clear
+	hdr_len = ( type == SERVER_LOG ? SERVER_LOG_ENTRY_HDR_SIZE : RAFT_LOG_ENTRY_HDR_SIZE );	// keeps our function more clear
 
 	for( i = 0; i < n_entries; i++ ) {
 		entries[i] = (log_entry_t *) malloc( sizeof( log_entry_t ) );
@@ -561,7 +561,7 @@ static inline void deserialize_log_entries( unsigned char *s_entries, unsigned i
 			exit( 1 );
 		}
 
-		if( class == SERVER_LOG ) { // xApp replication log entries
+		if( type == SERVER_LOG ) { // xApp replication log entries
 			memcpy( &server_hdr, s_entries, hdr_len );
 			// entry->term = 0;	 // not used by xApp replication
 			entry->index = NTOHLL( server_hdr.index) ;

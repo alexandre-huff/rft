@@ -31,18 +31,18 @@
 #include "types.h"
 
 #define RAFT_LOG_SIZE	512		// size of the ring to store raft log entries (power of 2)
-#define SERVER_LOG_SIZE	131072	// size of the ring to store server (xApp) log entries (power of 2)
+#define SERVER_LOG_SIZE	1048576	// size of the ring to store server (xApp) log entries (power of 2)
+// TODO change SERVER_LOG_SIZE to 131072 after implementing snapshotting
 
-
-int init_log( log_class_e class, u_int32_t size );
+int init_log( log_type_e type, u_int32_t size );
 log_entries_t *get_raft_log( );		// testing purposes
 log_entries_t *get_server_log( );	// testing purposes
 void append_raft_log_entry( log_entry_t *log_entry );
 void append_server_log_entry( log_entry_t *log_entry );
 log_entry_t *get_raft_log_entry( index_t log_index );
-log_entry_t *get_server_log_entry( index_t log_index, server_id_t *server_id );
+log_entry_t *get_server_log_entry( index_t log_index );
 index_t get_raft_last_log_index( );
-index_t get_server_last_log_index( server_id_t *server_id );
+index_t get_server_last_log_index( );
 term_t get_raft_last_log_term( );
 void free_log_entry( log_entry_t *entry );
 unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
