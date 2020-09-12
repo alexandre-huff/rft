@@ -86,6 +86,8 @@ See some xApp examples using the RFT library in the [examples](examples) directo
 
 Everyone is welcome to contribute to this project.
 
+You can get the latest development version at the **develop** branch.
+
 ## Versioning
 
 This RFT project is based on its previous alpha releases 0.1, 0.2, 0.3, and 0.4. The original project was reorganized in the form of a library to allow programmers to easily link the RFT into their applications to provide fault tolerance.
@@ -112,6 +114,7 @@ This project is licensed under the Apache License and Creative Commons License -
 
 ## Acknowledgments
 
-* Thanks to **Matti Hiltunen** from AT&T Labs - Research, and **Elias P. Duarte Jr.** from the Federal University of Parana for guiding this project.
-* Thanks to **Edward Scott Daniels** from AT&T Labs - Research for your valuable discussions.
+* Thanks to **Matti Hiltunen** from AT&T Labs - Research for guiding this project.
+* Thanks to **Edward Scott Daniels** from AT&T Labs - Research for the valuable discussions.
+* Thanks to **Elias P. Duarte Jr.** from the Federal University of Parana.
 * The logger module was inspired by the [Macro Logger](https://github.com/dmcrodrigues/macro-logger) project.
