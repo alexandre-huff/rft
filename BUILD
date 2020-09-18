@@ -76,7 +76,7 @@ Thus, the typical libraries required to be linked by the user application are th
 Note that the first option is the prefered option as it offers better throughput and latency. The NNG option is
 provided here for compatibility option with legacy applications that want to provide fault tolerance with the RFT.
 NNG compatibility will be removed in future versions, and programmers are encouraged to use the SI95 library as
-illustrated in the prefered linking option.
+illustrated in the preferred linking option.
 
 Logger levels
 
@@ -94,6 +94,6 @@ in the Makefile. The following logger levels are supported by the RFT library:
 	LOGGER_TRACE
 
 Each logger level adds more information shown in the standard error respectively from LOGGER_NONE to LOGGER_TRACE.
-Basically, this changes the compilation flag -DLOGGER_LEVEL=LOGGER_??? passed to the C compiler.
-The default logger level is LOGGER_INFO, and it should be changed to LOGGER_ERROR in production systems since it
-produces a lot of messages that may impose significant overheard and degrade the performance of the RFT library.
+The logger level is changed using the flag -DLOGGER_LEVEL=LOGGER_??? passed to the C compiler.
+The default logger level is LOGGER_INFO, and it should be changed to LOGGER_ERROR in production systems to decrease
+the number of messages that may impose significant overheard and degrade the performance of the RFT library.

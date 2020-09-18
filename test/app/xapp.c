@@ -58,31 +58,64 @@ enum recv_msg {
 	SUB
 };
 
-long my_state = 0;			// state maintained by this xapp (master)
-long rep_state = 0;			// state replicated from another xapp (slave)
+long pri_state = 0;			// state maintained by this xapp (primary)
+long bkp_state = 0;			// state replicated from another xapp (backup)
 
-// function that will be called by the rft library
+// function called by the rft library
 void apply_rstate( const int cmd, const char *context, const char *key, const unsigned char *data, const size_t dlen ) {
-	long value = *((long *) data);	// the same type of rep_state that will be passed from *data
 
 	switch ( cmd ) {
 		case SET_RSTATE:
-			rep_state = value;
+			bkp_state = (long) *data;
 			break;
 
 		case ADD_RSTATE:
-			rep_state += value;
+			bkp_state += (long) *data;
 			break;
 
 		case SUB_RSTATE:
-			rep_state -= value;
+			bkp_state -= (long) *data;
 			break;
 
 		default:
 			logger_warn( "unrecognized FSM command" );
 	}
 
-	// logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", rep_state, context, key );
+	// logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", bkp_state, context, key );
+}
+
+// function called by the rft library
+size_t take_snapshot( char **contexts, int nctx, unsigned int *items, unsigned char **data ) {
+	// an example of iterating over contexts
+	/* int i;
+	for( i = 0; i < nctx; i++ ) {
+		hashtable_get( table, contexts[i] )
+		// it could be: context|vlen|value|context|vlen|value...
+		memcpy( data, &state, size );
+	} */
+
+	*data = realloc( *data, sizeof(long) );
+	if( *data == NULL ) {
+		logger_fatal( "unable to realloc data while taking snapshot" );
+		exit( 1 );	// this will only exit the child process
+	}
+
+	*items = 1;
+	memcpy( *data, &pri_state, sizeof(long) );
+
+	return sizeof(long);
+}
+
+void install_snapshot( unsigned int items, const unsigned char *data ) {
+	// an example of iterating over contexts
+	/* int i;
+	for( i = 0; i < items; i++ ) {
+		// it could be: clen|context|klen|key|vlen|value|clen|context|klen|key|vlen|value...
+		memcpy( &value, &state, vlen );
+		// might involve use of hastable to get the context and its corresponding keys
+	} */
+	memcpy( &bkp_state, data, sizeof(long) );
+	logger_warn( "snapshot installed, bkp_state: %ld", bkp_state );
 }
 
 
@@ -95,6 +128,7 @@ int main( int argc, char **argv ) {
 	int			max_retries = 1;		// RMR max retries before giving up and returning to the xapp with RMR_ERR_RETRY
 	int			rts_retries = 0;		// max loop retries for rmr_rts_msg
 	int			rts_count;
+	char		wbuf[8];
 
 	#if LOGGER_LEVEL >= LOGGER_WARN
 		unsigned char target[RMR_MAX_SRC];
@@ -110,6 +144,7 @@ int main( int argc, char **argv ) {
 	long		retries = 0;
 	long		errors = 0;
 	long		timeouts = 0;
+	const long	ivalue = 1;				// increment value
 
 	while( ai < argc ) {
 		if( *argv[ai] == '-' ) {
@@ -144,6 +179,12 @@ int main( int argc, char **argv ) {
 	if( ! listen_port )
 		listen_port = "4560";
 
+	srand( time( NULL ) );
+	if( getenv( "RMR_RTG_SVC" ) == NULL ) {		// setting random listener port
+		snprintf( wbuf, sizeof(wbuf), "%d", 19000 + ( rand() % 1000 ) );
+		setenv( "RMR_RTG_SVC", wbuf, 1 );		// set one that won't collide with the default port if running on same host
+	}
+
 	mrc = rmr_init( listen_port, MAX_RCV_BYTES, RMRFL_NONE );
 	if( mrc == NULL ) {
 		logger_fatal( "unable to initialize RMR" );
@@ -166,7 +207,7 @@ int main( int argc, char **argv ) {
 	}
 
 	#ifndef NORFT
-	rft_init( mrc, listen_port, MAX_RCV_BYTES, apply_rstate );
+	rft_init( mrc, listen_port, MAX_RCV_BYTES, apply_rstate, take_snapshot, install_snapshot );
 	#endif
 
 	logger_info( "listening on port %s", listen_port );
@@ -204,9 +245,10 @@ int main( int argc, char **argv ) {
 					#endif
 
 					count++;
+					pri_state += ivalue;
 
 					#ifndef NORFT
-					rft_replicate( SET_RSTATE, "REL1", "counter", (unsigned char *) &count, sizeof(long) );
+					rft_replicate( ADD_RSTATE, "REL1", "counter", (unsigned char *) &ivalue, sizeof(long) );
 					#endif
 
 					msg = rmr_rts_msg( mrc, msg );

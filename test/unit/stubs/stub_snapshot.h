@@ -2,7 +2,6 @@
 /*
 ==================================================================================
 	Copyright (c) 2020 AT&T Intellectual Property.
-	Copyright (c) 2020 Alexandre Huff.
 
 	Licensed under the Apache License, Version 2.0 (the "License");
 	you may not use this file except in compliance with the License.
@@ -19,38 +18,16 @@
 */
 
 /*
-	Mnemonic:	rft_private.h
-	Abstract:	Private header file for the RFT library
+	Mnemonic:	stub_snapshot.h
+	Abstract:	Provides stub functions of the snapshot module to build RFT tests
 
-	Date:		6 April 2020
+	Date:		11 September 2020
 	Author:		Alexandre Huff
 */
 
-#ifndef _RFT_PRIV_H
-#define _RFT_PRIV_H
-
-#include "types.h"
-
 /*
-	This is the very first state used by a server to catch up all log entries from the leader before be added to the cluster
+	This is the callback function the RFT calls in the xApp code
 */
-#define INIT_SERVER 0
-/*
-	Defines the main server states
-*/
-#define FOLLOWER	1
-#define CANDIDATE	2
-#define LEADER		3
-
-
-/* ############## Private RFT functions ############## */
-
-void *send_append_entries( void *raft_server );
-void handle_membership_request( membership_request_t *membership_msg, char *rmr_src );
-raft_state_t *get_me( );
-server_id_t *get_myself_id( );
-void set_mrc( void *_mrc );
-index_t get_full_replicated_log_index( );
-
-
-#endif
+size_t take_snapshot( char **contexts, int nctx, unsigned int *items, unsigned char **data ) {
+	return 0;
+}

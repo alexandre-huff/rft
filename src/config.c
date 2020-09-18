@@ -558,7 +558,7 @@ int is_configuration_changing( ) {
 }
 
 /*
-	Picks out a replica server of the configuration to work as the replica server
+	Picks out replica servers from the configuration to work as the backup instances
 
 	Not thread-safe: assumes that the caller owns the "replica_lock"
 

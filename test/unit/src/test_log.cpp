@@ -39,6 +39,72 @@ extern "C" {
 	#include "mtl.h"
 	#include "../../src/static/logring.c"
 	#include "stubs/stub_logger.h"
+	#include "stubs/stub_snapshot.h"
+}
+
+TEST_GROUP( TestInitLog ) {
+	log_entries_t *raft_log = get_raft_log( );
+	log_entries_t *server_log = get_server_log( );
+
+	void setup() {
+
+	}
+
+	void teardown() {
+		if( raft_log->entries ) {
+			log_ring_free( raft_log->entries );
+			raft_log->entries = NULL;
+		}
+
+		if( server_log->entries ) {
+			log_ring_free( server_log->entries );
+			server_log->entries = NULL;
+		}
+	}
+};
+
+TEST( TestInitLog, InitRaftLog ) {
+	int ret;
+
+	// invalid size
+	ret = init_log( RAFT_LOG, 0, 10 );
+	LONGS_EQUAL( EINVAL, errno );
+	CHECK_FALSE( ret );
+
+	// invalid threshold size
+	ret = init_log( RAFT_LOG, 32, 0 );
+	LONGS_EQUAL( EINVAL, errno );
+	CHECK_FALSE( ret );
+
+	// valid arguments
+	ret = init_log( RAFT_LOG, 32, 10 );
+	CHECK_TRUE( ret );
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
+	UNSIGNED_LONGS_EQUAL( 10 * 1048576, raft_log->threshold );	// convert Mbytes to bytes
+}
+
+TEST( TestInitLog, InitServerLog ) {
+	int ret;
+
+	// invalid size
+	ret = init_log( SERVER_LOG, 0, 10 );
+	LONGS_EQUAL( EINVAL, errno );
+	CHECK_FALSE( ret );
+
+	// invalid threshold size
+	ret = init_log( SERVER_LOG, 32, 0 );
+	LONGS_EQUAL( EINVAL, errno );
+	CHECK_FALSE( ret );
+
+	// valid arguments
+	ret = init_log( SERVER_LOG, 32, 10 );
+	CHECK_TRUE( ret );
+	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->memsize );
+	UNSIGNED_LONGS_EQUAL( 10 * 1048576, server_log->threshold );	// convert Mbytes to bytes
 }
 
 TEST_GROUP( TestLog ) {
@@ -56,8 +122,14 @@ TEST_GROUP( TestLog ) {
 		snprintf( config_data.server_id, sizeof(server_id_t), "%s", server );
 		snprintf( config_data.target, sizeof(server_id_t), "%s", target );
 
-		init_log( RAFT_LOG, 64 );
-		init_log( SERVER_LOG, 64 );
+		init_log( RAFT_LOG, 64, 10 );
+		init_log( SERVER_LOG, 64, 10 );
+		raft_log->first_log_index = 1;
+		raft_log->last_log_index = 0;
+		raft_log->memsize = 0;
+		server_log->first_log_index = 1;
+		server_log->last_log_index = 0;
+		server_log->memsize = 0;
 	}
 
 	void teardown() {
@@ -74,7 +146,6 @@ TEST_GROUP( TestLog ) {
 			free( raft_log->entries->data );
 			free( raft_log->entries );
 			raft_log->entries = NULL;
-			raft_log->last_log_index = 0;
 		}
 
 		if( server_log->entries ) {
@@ -85,7 +156,6 @@ TEST_GROUP( TestLog ) {
 			free( server_log->entries->data );
 			free( server_log->entries );
 			server_log->entries = NULL;
-			server_log->last_log_index = 0;
 		}
 	}
 };
@@ -257,7 +327,36 @@ TEST( TestLog, AppendServerLogEntry ) {
 
 	entry = new_server_log_entry( "myctx", "mykey", command, &cmd_data, sizeof(cmd_data) );
 	CHECK( entry != NULL );
-	append_server_log_entry( entry );
+
+	mock()
+		.expectNoCall( "take_xapp_snapshot" );
+
+	append_server_log_entry( entry, NULL, NULL );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 1, server_log->last_log_index );	// we added the first log entry
+}
+
+TEST( TestLog, AppendServerLogEntry_TakeSnapshot ) {
+	int command = 1;
+	int cmd_data = 50;
+	hashtable_t htable;
+
+	entry = new_server_log_entry( "myctx", "mykey", command, &cmd_data, sizeof(cmd_data) );
+	CHECK( entry != NULL );
+
+	server_log->memsize = 1025;
+	server_log->threshold = 1024;
+
+	mock()
+		.expectOneCall( "take_xapp_snapshot" )
+		.withPointerParameter( "ctxtable", &htable )
+		.withPointerParameter( "take_snapshot_cb", (take_snapshot_cb_t *) take_snapshot );
+
+	append_server_log_entry( entry, &htable, take_snapshot );
+
+	mock().checkExpectations();
 
 	UNSIGNED_LONGS_EQUAL( 1, server_log->last_log_index );	// we added the first log entry
 }
@@ -276,7 +375,10 @@ TEST_GROUP( TestRaftLog ) {
 	void setup() {
 		me.commit_index = 0;
 
-		init_log( RAFT_LOG, 64 );
+		init_log( RAFT_LOG, 64, 10 );
+		raft_log->first_log_index = 1;
+		raft_log->last_log_index = 0;
+		raft_log->memsize = 0;
 
 		mock().disable();	// disabling mock checks (but it still returns the default mock value)
 
@@ -306,7 +408,6 @@ TEST_GROUP( TestRaftLog ) {
 			free( raft_log->entries->data );
 			free( raft_log->entries );
 			raft_log->entries = NULL;
-			raft_log->last_log_index = 0;
 		}
 	}
 };
@@ -460,10 +561,25 @@ TEST( TestRaftLog, SerializeRaftLogEntries ) {
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN );
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
 
+	// test with insufficient message size (passing only 1 byte to the message payload)
+	n_entries = setup_entries;
+	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN + 1 );
+	UNSIGNED_LONGS_EQUAL( 0, bytes );
+
+	/*
+		forcing to get a non-existent log index (or a compacted index)
+		should set errno to ENODATA to trigger a send snapshot
+	*/
+	n_entries = setup_entries;
+	bytes = serialize_raft_log_entries( 0, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN + 1 );
+	LONGS_EQUAL( ENODATA, errno )
+	UNSIGNED_LONGS_EQUAL( 0, bytes );
+
 	// testing with the same message size than the serialized log entries size + append entries header length
 	n_entries = setup_entries;	// the serialize function changes *n_entries
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, esize + APND_ENTR_HDR_LEN );
 	UNSIGNED_LONGS_EQUAL( esize, bytes );
+
 
 	if( buf )
 		free( buf );
@@ -541,17 +657,22 @@ TEST_GROUP( TestServerLog ) {
 	log_entries_t *server_log = get_server_log( );
 
 	void setup() {
-		init_log( SERVER_LOG, 64 );
+		init_log( SERVER_LOG, 64, 10 );
+		server_log->first_log_index = 1;
+		server_log->last_log_index = 0;
+		server_log->memsize = 0;
 
+		mock().disable();
 		for( int i = 0; i < setup_entries; i++ ) {
 			entry = new_server_log_entry( context, key, command, &cmd_data, sizeof(cmd_data) );
 			CHECK( entry != NULL );
-			append_server_log_entry( entry );
+			append_server_log_entry( entry, NULL, NULL );
 		}
+		mock().enable();
 	}
 
 	void teardown() {
-		// mock().clear();
+		mock().clear();
 
 		if( server_log->entries ) {
 			// freeing all log entries
@@ -565,7 +686,6 @@ TEST_GROUP( TestServerLog ) {
 			free( server_log->entries->data );
 			free( server_log->entries );
 			server_log->entries = NULL;
-			server_log->last_log_index = 0;
 		}
 	}
 };
@@ -608,6 +728,20 @@ TEST( TestServerLog, SerializeServerLogEntries ) {
 	// test with insufficient message size (passing only the required message header size)
 	n_entries = setup_entries;	// the serialize function changes *n_entries
 	bytes = serialize_server_log_entries( 1, &n_entries, &buf, &buf_len, REPL_REQ_HDR_LEN );
+	UNSIGNED_LONGS_EQUAL( 0, bytes );
+
+	// test with insufficient message size (passing only 1 byte to the message payload)
+	n_entries = setup_entries;
+	bytes = serialize_server_log_entries( 1, &n_entries, &buf, &buf_len, REPL_REQ_HDR_LEN + 1 );
+	UNSIGNED_LONGS_EQUAL( 0, bytes );
+
+	/*
+		forcing to get a non-existent log index (or a compacted index)
+		should set errno to ENODATA to trigger a send snapshot
+	*/
+	n_entries = setup_entries;
+	bytes = serialize_server_log_entries( 0, &n_entries, &buf, &buf_len, esize + REPL_REQ_HDR_LEN );
+	LONGS_EQUAL( ENODATA, errno );
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
 
 	// testing with the same message size than the serialized log entries size + append entries header length
@@ -668,4 +802,40 @@ TEST( TestServerLog, DeserializeServerLogEntries ) {
 		free( entries );
 	if( buf )
 		free( buf );
+}
+
+TEST( TestServerLog, CompactAllServerLogs ) {
+	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
+
+	mock()
+		.expectOneCall( "get_full_replicated_log_index" )
+		.andReturnValue( 2 );	// only the first log entry is fully replicated
+
+	compact_server_log( );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 3, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->memsize );
+}
+
+TEST( TestServerLog, CompactOneServerLog ) {
+	size_t size = server_log->memsize;
+
+	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
+
+	mock()
+		.expectOneCall( "get_full_replicated_log_index" )
+		.andReturnValue( 1 );	// only the first log entry is fully replicated
+
+	compact_server_log( );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 2, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( size / 2, server_log->memsize );	// we had only two entries with equal size
 }

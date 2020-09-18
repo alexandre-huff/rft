@@ -46,6 +46,7 @@
 #include "config.h"
 #include "log.h"
 #include "mtl.h"
+#include "snapshot.h"
 
 #include "static/hashtable.c"	// static hashtable
 #include "static/ringbuf.c"		// static FIFO ring buffer
@@ -80,6 +81,7 @@ pthread_mutex_t election_timeout_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t follower_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t leader_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t replica_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t installing_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_cond_t	tasks_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	raft_state_cond = PTHREAD_COND_INITIALIZER;
@@ -110,7 +112,7 @@ pthread_t replication_th;				// thread id for state replication
 static replication_type_e repl_type;	// replication type based on the RFT_REPLICA_SERVERS environmet variable
 static unsigned int num_replicas;		// stores the number of replica servers to replicate the xApp's state
 static int rep_intvl;					// defines the replication interval for the xApp's state
-static server_t *replica = NULL;		// defines which current replicas this server is replicating its xapp's state
+static server_t *replica = NULL;		// defines which current replica this server is replicating its xapp's state
 static replicas_t replica_servers = {	// set of servers that will be used to replicate the xApp's state
 	.len = 0,
 	.servers = NULL
@@ -126,6 +128,9 @@ static hashtable_t *ctxtab = NULL;	// hastable used to store if this xApp instan
 static int max_msg_size;
 
 apply_state_cb_t apply_command_cb;
+take_snapshot_cb_t take_xapp_snapshot_cb;
+install_snapshot_cb_t install_xapp_snapshot_cb;
+int installing_snapshot = 0;		// defined whether or not an install snapshot is in progress, to avoid duplicate messages
 
 
 /* ############ Implementation ############ */
@@ -159,8 +164,10 @@ void set_mrc( void *_mrc ) {
 	listen_port: rmr's listening port
 	rmr_max_msg_size: is the maximum receive message size passed as argument in rmr_init() function
 	apply_state_cb: is the callback function used by RFT to apply state changes
+	take_snapshot_cb: is the callback function used by RFT to take snapshots of the contexts (master role) from the xApp
 */
-void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb ) {
+void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb,
+					take_snapshot_cb_t take_snapshot_cb, install_snapshot_cb_t install_snapshot_cb ) {
 	server_id_t wbuf;
 	char *rft_id;			// used to change the server_id's name
 	char *envptr;			// general pointer to an environment variable value
@@ -172,6 +179,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		.server_id = {'\0'},
 		.target = {'\0'}
 	};
+	unsigned int threshold;	// threshold of the log size (in Mbytes) to trigger a snapshot function
 
 #if LOGGER_LEVEL < LOGGER_INFO
 	fprintf( stderr, "%lu %d/RFT [INFO] initializing RFT library\n", (unsigned long)time( NULL ), getpid( ) );
@@ -200,7 +208,9 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 	mrc = _mrc;
 
-	apply_command_cb = apply_state_cb;	// registering callback for xapp's commands
+	apply_command_cb = apply_state_cb;			// registering callback for xapp's commands
+	take_xapp_snapshot_cb = take_snapshot_cb;	// registering callback to xapp snapshotting
+	install_xapp_snapshot_cb = install_snapshot_cb;	// registering xapp's callback to install snapshots
 
 	envptr = getenv( "RFT_REPLICATION_INTERVAL" );
 	if( envptr != NULL ) {
@@ -220,6 +230,13 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 	} else {
 		repl_type = PARTIAL;
 		num_replicas = 1;		// default number of replica servers
+	}
+
+	envptr = getenv( "RFT_LOG_SIZE_THRESHOLD" );
+	if( envptr != NULL ) {
+		threshold = parse_uint( envptr );
+	} else {
+		threshold = LOG_SIZE_THRESHOLD;	// default size for both xApp and RAFT log size to trigger the corresponding snapshot function
 	}
 
 	rft_id = getenv( "RFT_SELF_ID" );
@@ -247,12 +264,12 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 
 	srand( time( NULL ) );
 
-	if( !init_log( RAFT_LOG, RAFT_LOG_SIZE ) ) {	// initilizing ring buffer to store raft logs
+	if( !init_log( RAFT_LOG, RAFT_LOG_SIZE, threshold ) ) {	// initializing ring buffer to store raft logs
 		logger_fatal( "unable to initialize buffer to store Raft logs (%s)", strerror( errno ) );
 		exit( 1 );
 	}
 
-	if( !init_log( SERVER_LOG, SERVER_LOG_SIZE ) ) {	// initializing ring buffer to store xapp logs
+	if( !init_log( SERVER_LOG, SERVER_LOG_SIZE, threshold ) ) {	// initializing ring buffer to store xapp logs
 		logger_fatal( "unable to initialize buffer to store xApp logs (%s)", strerror( errno ) );
 		exit( 1 );
 	}
@@ -368,15 +385,15 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 
 	entry = new_server_log_entry( context, key, command, value, len );
 
-	append_server_log_entry( entry );
-
 	// TODO Future: will be changed, most likely when raft configuration changes
-	if( hashtable_get( ctxtab, key ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
-		if( ! hashtable_insert( ctxtab, key, (void *) &primary_replica ) ) {
+	if( hashtable_get( ctxtab, context ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
+		if( ! hashtable_insert( ctxtab, context, (void *) &primary_replica ) ) {
 			logger_error( "unable to insert context %s in ctxtable as primary replica", context );
 			return 0;
 		}
 	}
+
+	append_server_log_entry( entry, ctxtab, take_xapp_snapshot_cb );
 
 	return 1;
 }
@@ -921,7 +938,7 @@ void *send_append_entries( void *raft_server ) {
 
 		pthread_mutex_unlock( &heartbeat_lock );
 
-		if( server->active ) {	// this server could be removed and so it do not need to wait for a signal to wake-up and finish
+		if( server->active ) {	// this server could be removed and so it does not need to wait for a signal to wake-up and finish
 
 			// putting this thread to sleep, waiting for a BROADCAST signal from become_leader
 			pthread_mutex_lock( &leader_lock );
@@ -988,6 +1005,8 @@ void *state_replication( ) {
 	struct timespec timeout;
 	unsigned int rep_i;					// counter to iterate over replica_servers' array
 	int must_lock;						// controls if it is required to get the replica_lock before going to sleep
+	snapshot_t *snapshot;				// points to the last snapshot
+	req_snapshot_hdr_t *snapshot_msg = NULL;
 
 	msg = rmr_alloc_msg( mrc, RMR_MAX_RCV_BYTES );
 	if( msg == NULL ) {
@@ -1032,33 +1051,69 @@ void *state_replication( ) {
 				// creating replication request
 				bytes = serialize_server_log_entries( master_index + 1, &n_entries, &srlz_buf, &buf_len, max_msg_size );
 
-				mlen = (int) ( sizeof( repl_req_hdr_t ) + bytes );	// getting required size for the whole message
-				if( mlen < 0 ){
-					logger_fatal( "size overflow of serialized append entries" );
-					exit( 1 );
-				}
-
-				if( rmr_payload_size( msg ) < mlen ) {
-					msg = (rmr_mbuf_t *) rmr_realloc_payload( msg, mlen, 0, 0 );
-					if( msg == NULL ) {
-						logger_fatal( "unable to reallocate rmr_mbuf payload for serializing state replication" );
+				if( bytes ) {
+					mlen = (int) ( sizeof( repl_req_hdr_t ) + bytes );	// getting required size for the whole message
+					if( mlen < 0 ){
+						logger_fatal( "size overflow of serialized append entries" );
 						exit( 1 );
 					}
-				}
-				request = (repl_req_hdr_t *) msg->payload;
-				request->master_index = master_index;
-				strcpy( request->server_id, me.self_id );
-				request->slen = bytes;			// setting serialized append entries payload size
-				request->n_entries = n_entries;
-				memcpy( REPL_REQ_PAYLOAD_ADDR( msg->payload ), srlz_buf, bytes );
 
-				pthread_mutex_lock( &replica_lock );
-				must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
-				if( replica ) {
-					logger_debug( "sending   replication request to %s, n_entries: %u, bytes: %u, master_index: %lu",
-								replica->server_id, request->n_entries, bytes, request->master_index );
+					if( rmr_payload_size( msg ) < mlen ) {
+						msg = (rmr_mbuf_t *) rmr_realloc_payload( msg, mlen, 0, 0 );
+						if( msg == NULL ) {
+							logger_fatal( "unable to reallocate rmr_mbuf payload for serializing state replication" );
+							exit( 1 );
+						}
+					}
+					request = (repl_req_hdr_t *) msg->payload;
+					request->master_index = master_index;
+					strcpy( request->server_id, me.self_id );
+					request->slen = bytes;			// setting serialized append entries payload size
+					request->n_entries = n_entries;
+					memcpy( REPL_REQ_PAYLOAD_ADDR( msg->payload ), srlz_buf, bytes );
 
-					rft_send_wh_msg( &msg, *replica->whid, REPLICATION_REQ, mlen, &replica->server_id );
+					pthread_mutex_lock( &replica_lock );
+					must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
+					if( replica ) {
+						logger_debug( "sending   replication request to %s, n_entries: %u, bytes: %u, master_index: %lu",
+									replica->server_id, request->n_entries, bytes, request->master_index );
+
+						rft_send_wh_msg( &msg, *replica->whid, REPLICATION_REQ, mlen, &replica->server_id );
+					}
+				} else if( errno == ENODATA ) {	// ENODATA means that no log entry was found, thus requires to SEND a SNAPSHOT
+					snapshot = get_xapp_snapshot( );
+					if( snapshot ) {
+						mlen = (int) ( SNAPSHOT_REQ_HDR_SIZE + snapshot->dlen );	// getting required size for the whole message
+						if( mlen < 0 ){
+							logger_fatal( "size overflow of serialized snapshot" );
+							exit( 1 );
+						}
+						if( rmr_payload_size( msg ) < mlen ) {
+							msg = (rmr_mbuf_t *) rmr_realloc_payload( msg, mlen, 0, 0 );
+							if( msg == NULL ) {
+								logger_fatal( "unable to reallocate rmr_mbuf payload to send a server snapshot" );
+								exit( 1 );
+							}
+						}
+						snapshot_msg = (req_snapshot_hdr_t *) msg->payload;
+						snapshot_msg->type = htonl( SERVER_SNAPSHOT );
+						snapshot_msg->last_log_index = HTONLL( snapshot->last_log_index );
+						snapshot_msg->dlen = HTONLL( snapshot->dlen );
+						snapshot_msg->items = htonl( snapshot->items );
+						strcpy( snapshot_msg->server_id, me.self_id );
+						memcpy( SNAPSHOT_REQ_PAYLOAD_ADDR( msg->payload ), snapshot->data, snapshot->dlen );
+
+						pthread_mutex_lock( &replica_lock );
+						must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
+						if( replica ) {
+							logger_warn( "sending snapshot request to %s, type: %d, items: %u, bytes: %lu, master_index: %lu",
+										replica->server_id, SERVER_SNAPSHOT, snapshot->items, snapshot->dlen, snapshot->last_log_index );
+
+							rft_send_wh_msg( &msg, *replica->whid, SNAPSHOT_REQ, mlen, &replica->server_id );
+						}
+					} else {
+						logger_warn( "no xapp snapshot has been taken yet" );
+					}
 				}
 			}
 		}
@@ -1550,6 +1605,85 @@ void handle_replication_reply( replication_reply_t *reply ) {
 		server->master_index = reply->replica_index;	// master_index receives the confirmation of replicas' replica_index
 }
 
+void handle_snapshot_request( snapshot_request_t *request, snapshot_reply_t *reply ) {
+	server_t *server = NULL;
+
+	assert( request != NULL );
+	assert( reply != NULL );
+
+	reply->type = request->type;
+	strcpy( reply->server_id, me.self_id );
+
+	server = raft_config_get_server( &request->server_id );
+
+	if( server ) {
+		if( request->type == SERVER_SNAPSHOT ) {
+			if( install_xapp_snapshot_cb != NULL ) {
+
+				pthread_mutex_lock( &installing_snapshot_lock );
+				if( !installing_snapshot ) {
+					installing_snapshot = 1;
+					pthread_mutex_unlock( &installing_snapshot_lock );
+
+					install_xapp_snapshot_cb( request->snapshot.items, request->snapshot.data );
+					server->replica_index = request->snapshot.last_log_index;
+					reply->success = 1;
+
+					pthread_mutex_lock( &installing_snapshot_lock );
+					installing_snapshot = 0;
+					pthread_mutex_unlock( &installing_snapshot_lock );
+				} else {
+					pthread_mutex_unlock( &installing_snapshot_lock );
+
+					reply->success = 0;
+				}
+
+			} else {
+				logger_warn( "there is no registered install snapshot callback" );
+				reply->success = 0;
+			}
+
+		} else if( request->type == RAFT_SNAPSHOT ) {
+			logger_fatal( "raft snapshot is not implemented yet" );
+			exit( 1 );
+		} else {
+			logger_warn( "unknown snapshot message type: %d", request->type );
+			reply->success = 0;
+		}
+
+		reply->last_log_index = server->replica_index;
+
+	} else {
+		logger_debug( "unable to find raft config server %s", request->server_id );
+		reply->last_log_index = 0;
+		reply->success = 0;
+	}
+}
+
+void handle_snapshot_reply( snapshot_reply_t *reply ) {
+	server_t *server = NULL;
+
+	assert( reply != NULL );
+
+	server = raft_config_get_server( &reply->server_id );
+
+	if( server ) {	// we update the replicated index even on unsuccessful snapshot
+		if( reply->type == SERVER_SNAPSHOT ) {
+			server->master_index = reply->last_log_index;	// master_index receives the confirmation of replicas' replica_index
+
+		} else if( reply->type == RAFT_SNAPSHOT ) {
+			logger_fatal( "raft snapshot is not implemented yet" );
+			exit( 1 );
+
+		} else {
+			logger_warn( "unknown snapshot message type: %d", reply->type );
+		}
+
+	} else {
+		logger_warn( "unable to find raft config server %s", reply->server_id );
+	}
+}
+
 /*
 	Implements a election timeout thread
 
@@ -1621,38 +1755,25 @@ void *trigger_election_timeout( ) {
 void *worker( ) {
 	unsigned int i;
 	rmr_mbuf_t *msg = NULL;
-	request_vote_t *req_vote_buf = NULL;
+	request_vote_t req_vote_buf;
 	request_vote_t *req_vote_msg = NULL;
 	reply_vote_t *reply_vote_msg = NULL;
 	membership_request_t *req_membership_msg = NULL;
 	appnd_entr_hdr_t *appndtrs_hdr = NULL;
-	request_append_entries_t *req_appndtrs_msg = NULL;
+	request_append_entries_t req_appndtrs_msg;
 	reply_append_entries_t *reply_appndtrs_msg = NULL;
 	repl_req_hdr_t *rep_hdr = NULL;		// replication request header
-	replication_request_t *rep_req_msg = NULL;
+	replication_request_t rep_req_msg;
 	replication_reply_t *rep_reply_msg = NULL;
 	unsigned char src_buf[RMR_MAX_SRC];	// rmr source address buffer used to connect to that server to send AppendEntries
 	unsigned char *src_buf_res = NULL;	// used to identify if the rmr_get_src ran successfuly
+	req_snapshot_hdr_t *req_snapshot_hdr = NULL;
+	snapshot_request_t req_snapshot_msg;
+	snapshot_reply_t *reply_snapshot_msg = NULL;
 
-	req_vote_buf = (request_vote_t *) malloc( sizeof( request_vote_t ) );
-	if( req_vote_buf == NULL ) {
-		logger_fatal( "unable to allocate buffer memory for req_vote_buf" );
-		exit( 1 );
-	}
-
-	req_appndtrs_msg = (request_append_entries_t *) malloc( sizeof( request_append_entries_t ) );
-	if( req_appndtrs_msg == NULL ) {
-		logger_fatal( "unable to allocate buffer memory to the request append entries message" );
-		exit( 1 );
-	}
-	req_appndtrs_msg->entries = NULL;	// assuring that realloc wont fail due an unsafe pointer
-
-	rep_req_msg = (replication_request_t *) malloc( sizeof( replication_request_t ) );
-	if( rep_req_msg == NULL ) {
-		logger_fatal( "unable to allocate buffer memory to the replication request message" );
-		exit( 1 );
-	}
-	rep_req_msg->entries = NULL;		// assuring that realloc wont fail due an unsafe pointer
+	req_appndtrs_msg.entries = NULL;		// assuring that realloc wont fail due an unsafe pointer
+	rep_req_msg.entries = NULL;				// assuring that realloc wont fail due an unsafe pointer
+	req_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
 
 	while( 1 ) {	// This is a worker thread that processes messages enqueued by the xApp
 
@@ -1667,34 +1788,34 @@ void *worker( ) {
 				appndtrs_hdr = (appnd_entr_hdr_t *) msg->payload;
 
 				// copying data from header to msg, memcpy cannot be used here because of unaligned data
-				appnd_entr_header_to_msg_cpy( appndtrs_hdr, req_appndtrs_msg );
+				appnd_entr_header_to_msg_cpy( appndtrs_hdr, &req_appndtrs_msg );
 
 				logger_trace( "receiving append entries request from %s, term: %lu, n_entries: %u, prev_idx: %lu, prev_term: %lu, commit: %lu",
-								req_appndtrs_msg->leader_id, req_appndtrs_msg->term, req_appndtrs_msg->n_entries,
-								req_appndtrs_msg->prev_log_index, req_appndtrs_msg->prev_log_term, req_appndtrs_msg->leader_commit );
+								req_appndtrs_msg.leader_id, req_appndtrs_msg.term, req_appndtrs_msg.n_entries,
+								req_appndtrs_msg.prev_log_index, req_appndtrs_msg.prev_log_term, req_appndtrs_msg.leader_commit );
 
-				if( req_appndtrs_msg->n_entries ) {	// if there is no entry, it is a heartbeat
+				if( req_appndtrs_msg.n_entries ) {	// if there is no entry, it is a heartbeat
 
 					// reallocating array to store pointers for deserialized append entries
-					req_appndtrs_msg->entries = (log_entry_t **) realloc( req_appndtrs_msg->entries, req_appndtrs_msg->n_entries * sizeof( log_entry_t **) );
-					if( req_appndtrs_msg->entries == NULL ) {
-						logger_fatal( "unable to allocate memory for new log entries in append entries request" );
+					req_appndtrs_msg.entries = (log_entry_t **) realloc( req_appndtrs_msg.entries, req_appndtrs_msg.n_entries * sizeof( log_entry_t **) );
+					if( req_appndtrs_msg.entries == NULL ) {
+						logger_fatal( "unable to allocate memory for new log entries on append entries request" );
 						exit( 1 );
 					}
 
 					// deserializing log entries delivered by the network message
-					deserialize_raft_log_entries( APND_ENTR_PAYLOAD_ADDR( msg->payload ), req_appndtrs_msg->n_entries, req_appndtrs_msg->entries );
+					deserialize_raft_log_entries( APND_ENTR_PAYLOAD_ADDR( msg->payload ), req_appndtrs_msg.n_entries, req_appndtrs_msg.entries );
 				}
 
 				reply_appndtrs_msg = (reply_append_entries_t *) msg->payload;
 
-				handle_append_entries_request( req_appndtrs_msg, reply_appndtrs_msg );
+				handle_append_entries_request( &req_appndtrs_msg, reply_appndtrs_msg );
 
-				logger_trace( "replying	append entries to %s, term: %lu, last_log_index: %lu, success: %d",
-								req_appndtrs_msg->leader_id, reply_appndtrs_msg->term,
+				logger_trace( "replying append entries to %s, term: %lu, last_log_index: %lu, success: %d",
+								req_appndtrs_msg.leader_id, reply_appndtrs_msg->term,
 								reply_appndtrs_msg->last_log_index, reply_appndtrs_msg->success );
 
-				rft_rts_msg( &msg, APPEND_ENTRIES_REPLY, sizeof( *reply_appndtrs_msg ), &req_appndtrs_msg->leader_id );
+				rft_rts_msg( &msg, APPEND_ENTRIES_REPLY, sizeof( *reply_appndtrs_msg ), &req_appndtrs_msg.leader_id );
 
 				/*
 					there is no need to free deserialized log entries (like in REPLICATION_REQ)
@@ -1718,34 +1839,33 @@ void *worker( ) {
 				rep_hdr = (repl_req_hdr_t *) msg->payload;
 
 				// copying data from header to msg, memcpy cannot be used here because of unaligned data
-				repl_req_header_to_msg_cpy( rep_hdr, rep_req_msg );
+				repl_req_header_to_msg_cpy( rep_hdr, &rep_req_msg );
 
 				logger_debug( "receiving replication request from %s, n_entries: %u, bytes: %u, master_index: %lu",
-								rep_req_msg->server_id, rep_req_msg->n_entries, rep_hdr->slen, rep_req_msg->master_index );
-
+								rep_req_msg.server_id, rep_req_msg.n_entries, rep_hdr->slen, rep_req_msg.master_index );
 
 				// reallocating array to store pointers for deserialized append entries
-				rep_req_msg->entries = (log_entry_t **) realloc( rep_req_msg->entries, rep_req_msg->n_entries * sizeof( log_entry_t **) );
-				if( rep_req_msg->entries == NULL ) {
+				rep_req_msg.entries = (log_entry_t **) realloc( rep_req_msg.entries, rep_req_msg.n_entries * sizeof( log_entry_t **) );
+				if( rep_req_msg.entries == NULL ) {
 					logger_fatal( "unable to reallocate memory for new log entries in replication request" );
 					exit( 1 );
 				}
 
 				// deserializing log entries delivered by the network message
-				deserialize_server_log_entries( REPL_REQ_PAYLOAD_ADDR( msg->payload ), rep_req_msg->n_entries, rep_req_msg->entries );
+				deserialize_server_log_entries( REPL_REQ_PAYLOAD_ADDR( msg->payload ), rep_req_msg.n_entries, rep_req_msg.entries );
 
 				rep_reply_msg = (replication_reply_t *) msg->payload;
 
-				handle_replication_request( rep_req_msg, rep_reply_msg );
+				handle_replication_request( &rep_req_msg, rep_reply_msg );
 
 				logger_debug( "replying  replication request to %s, replica_index: %lu, success: %d",
-								rep_req_msg->server_id, rep_reply_msg->replica_index, rep_reply_msg->success );
+								rep_req_msg.server_id, rep_reply_msg->replica_index, rep_reply_msg->success );
 
 				rft_rts_msg( &msg, REPLICATION_REPLY, sizeof( *rep_reply_msg ), &rep_reply_msg->server_id );
 
 				// freeing uneeded deserialized log entries after applying xapp's state
-				for( i = 0; i < rep_req_msg->n_entries; i++ ) {
-					free_log_entry( rep_req_msg->entries[i] );
+				for( i = 0; i < rep_req_msg.n_entries; i++ ) {
+					free_log_entry( rep_req_msg.entries[i] );
 				}
 
 				break;
@@ -1763,23 +1883,23 @@ void *worker( ) {
 			case VOTE_REQ:		// followers and candidates
 				req_vote_msg = (request_vote_t *) msg->payload;
 
-				memcpy( req_vote_buf, req_vote_msg, sizeof( *req_vote_msg ) ); // needs a buffer since reply vote is going to change the rmr payload
+				memcpy( &req_vote_buf, req_vote_msg, sizeof( *req_vote_msg ) ); // needs a buffer since reply vote is going to change the rmr payload
 
 				reply_vote_msg = (reply_vote_t *) msg->payload;
 
-				if ( strcmp( req_vote_buf->candidate_id, me.self_id ) == 0 )
+				if ( strcmp( req_vote_buf.candidate_id, me.self_id ) == 0 )
 					break;		// nothing to do, it has already voted to himself (candidate)
 
 				logger_debug( "receiving vote request from candidate %s => term: %lu, last_log_index: %lu, last_log_term: %lu",
-								req_vote_buf->candidate_id, req_vote_buf->term,
-								req_vote_buf->last_log_index, req_vote_buf->last_log_term );
+								req_vote_buf.candidate_id, req_vote_buf.term,
+								req_vote_buf.last_log_index, req_vote_buf.last_log_term );
 
-				handle_vote_request( req_vote_buf, reply_vote_msg );
+				handle_vote_request( &req_vote_buf, reply_vote_msg );
 
-				logger_debug( "replying vote request from candidate %s => term: %lu granted: %d",
-								req_vote_buf->candidate_id, reply_vote_msg->term, reply_vote_msg->granted );
+				logger_debug( "replying	vote request from candidate %s => term: %lu granted: %d",
+								req_vote_buf.candidate_id, reply_vote_msg->term, reply_vote_msg->granted );
 
-				rft_rts_msg( &msg, VOTE_REPLY, sizeof( *reply_vote_msg ), &req_vote_buf->candidate_id ); // sending reply_vote_msg
+				rft_rts_msg( &msg, VOTE_REPLY, sizeof( *reply_vote_msg ), &req_vote_buf.candidate_id ); // sending reply_vote_msg
 
 				break;
 
@@ -1809,6 +1929,42 @@ void *worker( ) {
 
 				break;
 
+			case SNAPSHOT_REQ:
+				req_snapshot_hdr = (req_snapshot_hdr_t *) msg->payload;
+
+				server_snapshot_header_to_msg_cpy( req_snapshot_hdr, &req_snapshot_msg );
+
+				logger_warn( "receiving snapshot request from %s, type: %d, items: %u, bytes: %lu, master_index: %lu", req_snapshot_msg.server_id,
+							req_snapshot_msg.type, req_snapshot_msg.snapshot.items, req_snapshot_msg.snapshot.dlen, req_snapshot_msg.snapshot.last_log_index );
+
+				// reallocating buffer to store snapshot
+				req_snapshot_msg.snapshot.data = (unsigned char *) realloc( req_snapshot_msg.snapshot.data, req_snapshot_msg.snapshot.dlen * sizeof(unsigned char) );
+				if( req_snapshot_msg.snapshot.data == NULL ) {
+					logger_fatal( "unable to reallocate memory to copy snapshot request" );
+					exit( 1 );
+				}
+				// copying snapshot data
+				memcpy( req_snapshot_msg.snapshot.data, SNAPSHOT_REQ_PAYLOAD_ADDR( msg->payload ), req_snapshot_msg.snapshot.dlen );
+
+				reply_snapshot_msg = (snapshot_reply_t *) msg->payload;
+
+				handle_snapshot_request( &req_snapshot_msg, reply_snapshot_msg );
+
+				logger_warn( "replying snapshot request to %s, type: %d, replica_index: %lu, success: %d", req_snapshot_msg.server_id,
+											reply_snapshot_msg->type, reply_snapshot_msg->last_log_index, reply_snapshot_msg->success );
+
+				rft_rts_msg( &msg, SNAPSHOT_REPLY, sizeof(snapshot_reply_t), &reply_snapshot_msg->server_id );
+				break;
+
+			case SNAPSHOT_REPLY:
+				reply_snapshot_msg = (snapshot_reply_t *) msg->payload;
+
+				logger_warn( "receiving snapshot reply from %s, type: %d, replica_index: %lu, success: %d", reply_snapshot_msg->server_id,
+								reply_snapshot_msg->type, reply_snapshot_msg->last_log_index, reply_snapshot_msg->success );
+
+				handle_snapshot_reply( reply_snapshot_msg );
+				break;
+
 			default:
 				logger_warn( "unrecognized rft message type: %d", msg->mtype);
 				break;
@@ -1817,4 +1973,29 @@ void *worker( ) {
 		rmr_free_msg( msg );			// message must be freed since it is a copy dequeued from rft's queue
 	}
 
+}
+
+/*
+	Returns the index of the last log entry which is replicated among all replica servers
+*/
+index_t get_full_replicated_log_index( ) {
+	unsigned int i;
+	index_t last_index;
+
+	pthread_mutex_lock( &replica_lock );
+
+	assert( replica_servers.len > 0 );	// It is an error calling this function if there is no replica server
+
+	if( replica_servers.len > 0 ) {
+		last_index = replica_servers.servers[0]->master_index;
+		for( i = 1; i < replica_servers.len; i++ ) {
+			if( last_index < replica_servers.servers[i]->master_index )
+				last_index = replica_servers.servers[i]->master_index;
+
+		}
+	}
+
+	pthread_mutex_unlock( &replica_lock );
+
+	return last_index;
 }

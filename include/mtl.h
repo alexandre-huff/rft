@@ -20,7 +20,7 @@
 
 /*
 	Mnemonic:	mtl.h
-	Abstract:	Implements the RFT Message Transport Layer API header for
+	Abstract:	Defines the RFT Message Transport Layer API header for
 				exchanging messages between replication servers
 
 	Date:		04 December 2019
@@ -34,7 +34,6 @@
 #include <arpa/inet.h>
 
 #include "types.h"
-
 
 /* ===================== Conversion of 64 bit integers using two 32 bit htonl|ntofl functions ===================== */
 /*
@@ -57,10 +56,10 @@
 typedef struct appnd_entr_hdr {
 	term_t term;				// leader’s term
 	server_id_t leader_id;		// so follower can redirect clients
-	index_t prev_log_index;	// index of log entry immediately preceding new ones
+	index_t prev_log_index;		// index of log entry immediately preceding new ones
 	term_t prev_log_term;		// term of prevLogIndex entry
 	index_t leader_commit;		// leader’s commitIndex
-	unsigned int n_entries;	// defines the number of the entries carried by this message
+	unsigned int n_entries;		// defines the number of the entries carried by this message
 	unsigned int slen;			// holds the serialized payload length in bytes
 } appnd_entr_hdr_t;
 
@@ -137,9 +136,28 @@ typedef struct server_log_entry_hdr {
 #define SERVER_KEY_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SERVER_LOG_ENTRY_HDR_SIZE + SERVER_CTX_PAYLOAD_LEN(hdr) )
 #define SERVER_DATA_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SERVER_LOG_ENTRY_HDR_SIZE + SERVER_CTX_PAYLOAD_LEN(hdr) + SERVER_KEY_PAYLOAD_LEN(hdr) )
 
+/*
+	Defines a header to transport snapshots
+	Note: on adding or removing fields, check SNAPSHOT_REQ_HDR_SIZE and its related macros, and serialize/deserialize functions
+	DANGER:	keep this struct aligned to avoid serialize/deserialize wrong information,
+			care must be taken when adding, removing, or moving a field from its position
+*/
+typedef struct req_snapshot_hdr {
+	index_t last_log_index;		// index of the snapshot's last log entry
+	size_t dlen;				// length of the snapshot data
+	snapshot_type_e type;		// defines of the snapshot is of type either raft or server
+	unsigned int items;			// number of context/key/value group items
+	server_id_t server_id;
+} req_snapshot_hdr_t;
+
+/*
+	Defines the header size of a snapshot message
+*/
+#define SNAPSHOT_REQ_HDR_SIZE ( sizeof(req_snapshot_hdr_t) )
+#define SNAPSHOT_REQ_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SNAPSHOT_REQ_HDR_SIZE )
 
 void appnd_entr_header_to_msg_cpy( appnd_entr_hdr_t *header, request_append_entries_t *msg );
 void repl_req_header_to_msg_cpy( repl_req_hdr_t *header, replication_request_t *msg );
-
+void server_snapshot_header_to_msg_cpy( req_snapshot_hdr_t *header, snapshot_request_t *msg );
 
 #endif

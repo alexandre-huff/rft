@@ -20,7 +20,7 @@
 
 /*
 	Mnemonic:	mtl.c
-	Abstract:	Implements a RFT Message Transport Layer API to exchange messages
+	Abstract:	Implements the RFT Message Transport Layer API to exchange messages
 				between RFT servers
 
 	Date:		04 December 2019
@@ -71,4 +71,22 @@ void repl_req_header_to_msg_cpy( repl_req_hdr_t *header, replication_request_t *
 	msg->n_entries = header->n_entries;
 	strcpy( msg->server_id, header->server_id );
 
+}
+
+/*
+	Copies network header data from a server snapshot request to a snapshot request message
+
+	It is the caller responsibility to allocate and freeing both pointers
+
+	memcpy cannot be used since of possible unaligned data
+*/
+void server_snapshot_header_to_msg_cpy( req_snapshot_hdr_t *header, snapshot_request_t *msg ) {
+	assert( header != NULL );
+	assert( msg != NULL );
+
+	msg->type = ntohl( header->type );
+	msg->snapshot.last_log_index = NTOHLL( header->last_log_index );
+	msg->snapshot.dlen = NTOHLL( header->dlen );
+	msg->snapshot.items = ntohl( header->items );
+	strcpy( msg->server_id, header->server_id );
 }

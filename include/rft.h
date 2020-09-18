@@ -42,6 +42,8 @@
 #define MEMBERSHIP_REQ			204		// Message sent from a server which is trying to join to the cluster
 #define REPLICATION_REQ			205		// Append Entries used to replicate log entries for xApps commands
 #define REPLICATION_REPLY		206		// Append Entries replication reply for xApps commands
+#define SNAPSHOT_REQ			207		// Snapshot request message
+#define SNAPSHOT_REPLY			208
 
 #define HEARTBEAT_TIMETOUT		1000	// time (ms) that a leader waits before issue a heartbeat message
 
@@ -69,10 +71,31 @@
 */
 #define REPLICATION_INTERVAL	10
 
-/* FSM apply callback function that xApps must to implement */
+/*
+	Defines the threshold (in Mbytes) to trigger the corresponding snapshot function
+	Basically, it defines the maximum size a log can grow up to create a new snapshot
+	This constant is used for both, RAFT and xApp log entries
+*/
+#define LOG_SIZE_THRESHOLD			10
+
+/* FSM apply callback function that xApps must implement */
 typedef void (*apply_state_cb_t)(const int command, const char *context, const char *key, const unsigned char *value, const size_t len);
 
-extern void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb );
+/*
+	This callback must be implemented by the xApp to provide the snapshot of its state to the RFT
+	The data param can and must be reallocked and the size of the snapshot copied into
+	data must be returned
+	The context param contains a list of contexts to take snapshot, and the
+	nctx param holds the number of contexts to take the snapshot
+	This function is thread-safe as it is called by a copy-on-write child process, thus
+	it does not conflicts with the running parent process
+*/
+typedef size_t (*take_snapshot_cb_t)( char **contexts, int nctx, unsigned int *items, unsigned char **data );
+
+typedef void (*install_snapshot_cb_t)( unsigned int items, const unsigned char *data );
+
+extern void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb,
+								take_snapshot_cb_t take_snapshot_cb, install_snapshot_cb_t install_snapshot_cb );
 extern int rft_enqueue_msg( rmr_mbuf_t *msg );
 extern int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len );
 

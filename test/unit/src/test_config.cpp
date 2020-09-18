@@ -36,6 +36,7 @@ extern "C" {
 	#include "stubs/stub_pthread.h"
 }
 
+
 TEST_GROUP( TestConfig ) {
 	server_id_t server_id;
 	char target[64];

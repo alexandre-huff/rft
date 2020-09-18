@@ -37,7 +37,10 @@
 #include "utils.h"
 #include "mtl.h"
 #include "config.h"
+#include "static/hashtable.c"
 #include "static/logring.c"
+#include "snapshot.h"
+#include "rft_private.h"
 
 
 pthread_mutex_t raft_log_lock = PTHREAD_MUTEX_INITIALIZER;		// mutex for locking the raft_log variable
@@ -48,14 +51,21 @@ pthread_mutex_t server_log_lock = PTHREAD_MUTEX_INITIALIZER;	// mutex for lockin
 	Stores log entries for the membership management and replication based on the raft algorithm
 */
 static log_entries_t raft_log = {
+	.memsize = 0,
+	.threshold = 1024,
+	.first_log_index = 1,
 	.last_log_index = 0,
 	.entries = NULL
 };
 
 /*
+	This is specific for xApp asynchronous replication
 	Stores log entries replicated by this xapp to other xapps
 */
 static log_entries_t xapp_log = {
+	.memsize = 0,
+	.threshold = 1024,
+	.first_log_index = 1,
 	.last_log_index = 0,
 	.entries = NULL
 };
@@ -72,9 +82,23 @@ log_entries_t *get_raft_log( ) {
 }
 
 /*
+	Acquires the mutex of the server log
+*/
+void lock_server_log( ) {
+	pthread_mutex_lock( &server_log_lock );
+}
+
+/*
+	Releases the mutex of the server log
+*/
+void unlock_server_log( ) {
+	pthread_mutex_unlock( &server_log_lock );
+}
+
+/*
 	Used only for testing purposes
 
-	Returns a server's log pointer (xApp state replication log)
+	Returns a pointer of the server log (xApp state replication log)
 
 	Not thread-safe, assumes that the log_lock has been acquired by the caller
 */
@@ -85,20 +109,27 @@ log_entries_t *get_server_log( ) {
 /*
 	Initializes either, RAFT or SERVER log entry structures
 
+	Paramenters:
+	type: defines the type of the log (i.e. RAFT_LOG or SERVER_LOG)
+	size: defines the size of the ring to store log entries (needs to be a prime number)
+	threshold: defines the threshold of the log (in Mbytes) to trigger the snapshot function
+
 	Returns 1 on success. On error, 0 is returned and errno is set to indicate the error.
 */
-int init_log( log_type_e type, u_int32_t size ) {
-	if( type == RAFT_LOG ) {
+int init_log( log_type_e type, u_int32_t size, u_int32_t threshold ) {
+	if( type == RAFT_LOG && threshold > 0 ) {
 		raft_log.entries = log_ring_create( size );
 		if( raft_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
+		raft_log.threshold = threshold * 1048576;	// convert Mbytes to bytes
 
-	} else if( type == SERVER_LOG ) {
+	} else if( type == SERVER_LOG && threshold > 0 ) {
 		xapp_log.entries = log_ring_create( size );
 		if( xapp_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
+		xapp_log.threshold = threshold * 1048576;	// convert Mbytes to bytes
 
 	} else {
 		errno = EINVAL;	// invalid log type
@@ -114,16 +145,23 @@ int init_log( log_type_e type, u_int32_t size ) {
 	Sets the log_index of the new log entry according to its position in the log
 
 	IMPORTANT:
-		Not thread-safe, assumes that the log's lock has been acquired by the caller if required
+		No thread-safe, assumes that the log's lock has been acquired by the caller if required
 */
 static inline int append_log_entry( log_entry_t *log_entry, log_entries_t *log ) {
 	assert( log_entry != NULL );
 	assert( log != NULL );
 
-	log->last_log_index++;	// raft starts its log index at 1, so we need to add 1 here
-	log_entry->index = log->last_log_index;
+	// raft starts its log index at 1, so we need to add 1 here
+	log_entry->index = log->last_log_index + 1;
 
-	return log_ring_insert( log->entries, log_entry );
+	if( log_ring_insert( log->entries, log_entry ) ) {
+		log->last_log_index++;
+		// increasing the size of the log to trigger snapshots
+		log->memsize += sizeof(log_entry_t) + log_entry->dlen + log_entry->clen + log_entry->klen;
+		return 1;
+	}
+
+	return 0;
 }
 
 /*
@@ -184,12 +222,18 @@ void append_raft_log_entry( log_entry_t *log_entry ) {
 
 	This is for the xApp state replication log entries
 
+	max_log_size: the maximum size the server log can grow before taking a snapshot (in Mbytes)
+
 	Sets the log_index of the new log entry according to its position in the log
 */
-void append_server_log_entry( log_entry_t *log_entry ) {
+void append_server_log_entry( log_entry_t *log_entry, hashtable_t *ctxtable, take_snapshot_cb_t take_xapp_snapshot_cb ) {
 	assert( log_entry != NULL );
 
 	pthread_mutex_lock( &server_log_lock );
+
+	if( xapp_log.memsize > xapp_log.threshold )
+		take_xapp_snapshot( ctxtable, take_xapp_snapshot_cb );
+
 	// wrapper as same as append raft log entry
 	if( !append_log_entry( log_entry, &xapp_log ) ) {
 		logger_fatal( "unable to append a new xapp log entry (%s)", strerror( ENOBUFS ) );
@@ -385,17 +429,19 @@ inline void free_log_entry( log_entry_t *entry ) {
 
 	IMPORTANT: not thread-safe, assumes that the caller owns the lock of the log param (if required)
 
-	from_index: defines the starting raft log index that the serialization must start
+	from_index: defines the starting log index that the serialization must start
 	n_entries: defines the number of entries to be serialized
-	**lbuf: is the log buffer where the the serialized data will be written (will be reallocated if it is not enough)
+	**lbuf: is the log buffer where the serialized data will be written to (will be reallocated if it is not enough)
 	*buf_len: defines the current size of the lbuf
-	max_buf_len: indicates the maximum number of bytes can be added in the message. This function does not take into account
+	max_buf_len: indicates the maximum number of bytes that can be added in the message. This function does not take into account
 				 the size of the RFT mtl header, so, it needs to be subtracted from the RMR' maximum message size before
 				 calling this function. The RMR's maximum message size is defined in the xApp context and passed via argument
 				 to the RFT init function.
 	type:	defines which type of log we are serializing (RAFT or SERVER)
 
 	Returns the total of serialized bytes
+	In case it returns 0, then errno is set:
+		ENODATA: log entry not found, required to install a snapshot
 */
 static inline unsigned int serialize_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
 												unsigned int *buf_len, int max_buf_len, log_entries_t *log, log_type_e type ) {
@@ -412,8 +458,10 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 		for( ; (count < *n_entries) && (bytes < max_buf_len) && ( max_buf_len > 0 ); from_index++, count++ ) {
 
 			entry = log_ring_get( log->entries, from_index );
-			if( entry == NULL )
+			if( entry == NULL ) {
+				errno = ENODATA;
 				break;
+			}
 
 			if( type == SERVER_LOG ) {
 				esize = SERVER_LOG_ENTRY_HDR_SIZE + entry->clen + entry->klen + entry->dlen;	// entry size = header + command
@@ -431,7 +479,7 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 
 				*lbuf = (unsigned char *) realloc( *lbuf, *buf_len );
 				if( *lbuf == NULL ) {
-					logger_fatal( "unable to realloc memory to serialize log buffer" );
+					logger_fatal( "unable to reallocate memory to serialize log buffer" );
 					exit( 1 );
 				}
 			}
@@ -468,10 +516,9 @@ static inline unsigned int serialize_log_entries( index_t from_index, unsigned i
 		}
 
 		*n_entries = count;
-		if( !count )	// if count is 0, then no log entry can be sent
+		if( !count && entry )	// if count is 0 but there is a log entry to send, then the log entry exceeded the max msg size
 			logger_error( "unable to serialize log entries, "
-							"reason: size of a log entry is greater than the RMR's max msg size" );
-
+						"reason: size of a log entry is greater than the RMR's max msg size" );
 	} else {
 		logger_fatal( "unable to serialize log entries, out of range ==> (from_index + n_entries)=%lu <= log.last_log_index=%lu",
 						from_index + *n_entries, log->last_log_index );
@@ -497,13 +544,16 @@ unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_ent
 										 unsigned int *buf_len, int max_msg_size ) {
 	// this is a wrapper function
 	unsigned int bytes;
+	int err_code;
 
 	pthread_mutex_lock( &raft_log_lock );
 
 	// we can only serialize RMR's max_msg_size MINUS size of the append entries mtl header
 	bytes = serialize_log_entries( from_index, n_entries, lbuf, buf_len, max_msg_size - APND_ENTR_HDR_LEN, &raft_log, RAFT_LOG );
 
+	err_code = errno;	// saving due to mutex_unlock which could change it
 	pthread_mutex_unlock( &raft_log_lock );
+	errno = err_code;	// restoring
 
 	return bytes;
 }
@@ -517,7 +567,6 @@ unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_ent
 	n_entries: defines the number of entries to be serialized
 	**lbuf: is the log buffer where the the serialized data will be written (will be reallocated if it is not enough)
 	*buf_len: defines the current size of the lbuf
-	*server_id: defines from which server the log will be returned
 
 	Returns the total of serialized bytes
 */
@@ -525,13 +574,16 @@ unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_e
 											unsigned int *buf_len, int max_msg_size ) {
 	// this is a wrapper function
 	unsigned int bytes;
+	int err_code;
 
 	pthread_mutex_lock( &server_log_lock );
 
 	// we can only serialize RMR's max_msg_size MINUS size of the replication request mtl header
 	bytes = serialize_log_entries( from_index, n_entries, lbuf, buf_len, max_msg_size - REPL_REQ_HDR_LEN, &xapp_log, SERVER_LOG );
 
+	err_code = errno;	// saving due to mutex_unlock which could change it
 	pthread_mutex_unlock( &server_log_lock );
+	errno = err_code;	// restoring
 
 	return bytes;
 }
@@ -724,4 +776,49 @@ log_entry_t *new_server_log_entry( const char *context, const char *key, int com
 	/* this is a wrapper function */
 
 	return new_log_entry( 0, SERVER_COMMAND, context, key, command, data, len );
+}
+
+/*
+	Does log compaction of server logs
+
+	Only logs that are replicated on all replica servers are compacted (removed)
+
+	This function is meant to be called right after taking each snapshot
+	and before release the snapshot in_progress flag
+*/
+void compact_server_log( ) {
+	index_t index;
+	index_t to_index;
+	log_entry_t *entry;
+	/*
+		We are incrementing +1 in to_index to include it on log compaction
+		Using the <= operator does not work when the usigned long overflows back to 0, in this case
+		the log compaction would stop before compacting all required log entries
+	*/
+	to_index = get_full_replicated_log_index( ) + 1;
+
+	pthread_mutex_lock( &server_log_lock );
+	index = xapp_log.first_log_index;
+	pthread_mutex_unlock( &server_log_lock );
+
+	for( ; index != to_index; index++ ) {
+
+		pthread_mutex_lock( &server_log_lock );
+		entry = log_ring_extract( xapp_log.entries );
+		pthread_mutex_unlock( &server_log_lock );
+		if( entry ) {
+			xapp_log.memsize -= sizeof(log_entry_t) + entry->dlen + entry->clen + entry->klen;
+			free_log_entry( entry );
+		} else {
+			logger_fatal( "unable to find and delete the log entry with index %ul", index );
+			exit( 1 );
+		}
+	}
+	pthread_mutex_lock( &server_log_lock );
+	xapp_log.first_log_index = to_index;	// first_log_index is the next valid log entry (to_index was incremented before the loop)
+
+	logger_warn( "server logs compacted, remaining entries: %lu, size: %.3f mb",
+				xapp_log.last_log_index - xapp_log.first_log_index + 1, xapp_log.memsize / (float)1048576 ); // bytes to Mbytes
+
+	pthread_mutex_unlock( &server_log_lock );
 }

@@ -30,16 +30,17 @@
 #define _RFT_LOG_H
 
 #include "types.h"
+#include "rft.h"
+#include "hashtable.h"
 
 #define RAFT_LOG_SIZE	512		// size of the ring to store raft log entries (power of 2)
-#define SERVER_LOG_SIZE	1048576	// size of the ring to store server (xApp) log entries (power of 2)
-// TODO change SERVER_LOG_SIZE to 131072 after implementing snapshotting
+#define SERVER_LOG_SIZE	131072	// size of the ring to store server (xApp) log entries (power of 2)
 
-int init_log( log_type_e type, u_int32_t size );
+int init_log( log_type_e type, u_int32_t size, u_int32_t threshold );
 log_entries_t *get_raft_log( );		// testing purposes
 log_entries_t *get_server_log( );	// testing purposes
 void append_raft_log_entry( log_entry_t *log_entry );
-void append_server_log_entry( log_entry_t *log_entry );
+void append_server_log_entry( log_entry_t *log_entry, hashtable_t *ctxtable, take_snapshot_cb_t take_xapp_snapshot_cb );
 log_entry_t *get_raft_log_entry( index_t log_index );
 log_entry_t *get_server_log_entry( index_t log_index );
 index_t get_raft_last_log_index( );
@@ -47,7 +48,7 @@ index_t get_server_last_log_index( );
 term_t get_raft_last_log_term( );
 void free_log_entry( log_entry_t *entry );
 unsigned int serialize_raft_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
-										 unsigned int *buf_len, int max_msg_size );
+											unsigned int *buf_len, int max_msg_size );
 unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_entries, unsigned char **lbuf,
 											unsigned int *buf_len, int max_msg_size );
 void deserialize_raft_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries );
@@ -55,6 +56,9 @@ void deserialize_server_log_entries( unsigned char *s_entries, unsigned int n_en
 int remove_raft_conflicting_entries( index_t from_index, index_t committed_index );
 log_entry_t *new_raft_log_entry( term_t term, log_entry_type_e type, int command, void *data, size_t len );
 log_entry_t *new_server_log_entry( const char *context, const char *key, int command, void *data, size_t len );
+void lock_server_log( );
+void unlock_server_log( );
+void compact_server_log( );
 
 
 #endif			/* dup include prevention */

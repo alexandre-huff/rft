@@ -114,6 +114,14 @@ typedef enum replication_type {
 } replication_type_e;
 
 /*
+	Defines the type of the snapshot
+*/
+typedef enum snapshot_type {
+	RAFT_SNAPSHOT,		// raft snapshot
+	SERVER_SNAPSHOT		// xapp snapshot
+} snapshot_type_e;
+
+/*
 	Defines the particular RAFT state for the current server instance (me)
 */
 typedef struct raft_state {
@@ -222,12 +230,15 @@ typedef struct log_entry {
 	Defines the in-memory log structure
 */
 typedef struct log_entries {
-	index_t last_log_index;	// the index of the last log saved in entries
-	logring_t *entries;		// ring buffer pointing to the log entries
+	size_t memsize;				// memory size (in bytes) of all log entries stored in the *entries ring (data and metadata)
+	size_t threshold;			// defines the threshold (in bytes) to trigger the corresponding snapshot function
+	index_t first_log_index;	// the first index of the stored log entries (used for snapshotting)
+	index_t last_log_index;		// the index of the last log saved in entries
+	logring_t *entries;			// ring buffer pointing to the log entries
 } log_entries_t;
 
 /*
-	Invoked by the leader to replicate log entries, also used as heartbeat
+	Invoked by leader to replicate log entries, also used as heartbeat
 	DANGER: on modifying this struct check the definition of apnd_entr_hdr_t in mtl.h
 	Do NOT use this as a network transport layer, use mtl api instead
 */
@@ -264,7 +275,7 @@ typedef struct replicas {
 	Do NOT use it as a network transport layer, use mtl api instead
 */
 typedef struct replication_request {
-	index_t master_index;		// index of log entry immediately preceding new ones
+	index_t master_index;		// index of the log entry immediately preceding new ones
 	server_id_t server_id;		// identified from which server this replication is comming
 	unsigned int n_entries;		// defines the number of the entries carried by this message
 	log_entry_t **entries;		// log entries deserialized
@@ -305,5 +316,28 @@ typedef struct membership_request {
 	index_t last_log_index;
 	server_id_t server_id;
 } membership_request_t;
+
+/*
+	Defines a generic snapshot structure
+*/
+typedef struct snapshot {
+	index_t last_log_index;	// snapshot index of log entry immediately preceding new ones
+	size_t dlen;			// data length of the snapshot
+	unsigned int items;		// number of items in the snapshot data ( each item corresponds to: clen|context|klen|key|vlen|value )
+	unsigned char *data;	// pointer to the state data
+} snapshot_t;
+
+typedef struct snapshot_request {
+	snapshot_type_e type;		// RAFT or SERVER
+	server_id_t server_id;
+	snapshot_t snapshot;
+} snapshot_request_t;
+
+typedef struct snapshot_reply {
+	snapshot_type_e type;		// RAFT or SERVER
+	int success;				// true if server contained entry matching prev_log_index
+	index_t last_log_index;		// the highest replicated index in the server
+	server_id_t server_id;		// identifies the server which is replying this message
+} snapshot_reply_t;
 
 #endif
