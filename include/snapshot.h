@@ -57,5 +57,11 @@ typedef struct ctx_metabuf {
 
 void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot_cb );
 snapshot_t *get_xapp_snapshot( );
+int *get_in_progress( );			// testing purposes
+ctx_metabuf_t *get_ctx_metabuf( );	// testing purposes
+void *parent_thread( );				// testing purposes
+snapshot_t *get_ctx_snapshot( );	// testing purposes
+primary_ctx_t *get_primary_ctxs( );	// testing purposes
+void primary_ctx_handler( hashtable_t *table, const char *key );	// testing purposes
 
 #endif

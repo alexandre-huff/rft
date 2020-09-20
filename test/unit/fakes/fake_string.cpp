@@ -55,14 +55,32 @@ char *strndup( const char *str, size_t max_len ) {
 	size_t len;
 
 	if( str != NULL && max_len ) {
-		len = strlen( str ) + 1;
+		len = strlen( str );
 		if( len > max_len )
-			len = max_len + 1;
-		s = (char*) cpputest_malloc_location( len, __FILE__, __LINE__ );
-		// s = (char*) malloc( len );
+			len = max_len;
+		s = (char*) cpputest_malloc_location( len + 1, __FILE__, __LINE__ );
+		// s = (char*) malloc( len + 1 );
 		if( s != NULL ) {
-			memcpy( s, str, len - 1 );
-			s[len-1] = '\0';
+			memcpy( s, str, len );
+			s[len] = '\0';
+			return s;
+		}
+	}
+
+	return NULL;
+}
+
+char *strdup(const char *str) {
+	char *s;
+	size_t len;
+
+	if( str != NULL ) {
+		len = strlen( str );
+		s = (char*) cpputest_malloc_location( len + 1, __FILE__, __LINE__ );
+		// s = (char *) malloc( len + 1 );
+		if( s != NULL ) {
+			memcpy( s, str, len );
+			s[len] = '\0';
 			return s;
 		}
 	}

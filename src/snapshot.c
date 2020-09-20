@@ -47,7 +47,8 @@
 
 int in_progress = 0;			// defines if the snapshot is in progress
 int ctx_pipe[2];				// pipe for context snapshotting
-primary_ctx_t ctx;
+ctx_metabuf_t ctx_metabuf;		// metadata of the snapshot taken from the xapp
+primary_ctx_t pctxs;			// stores temporary primary contexts which will be snapshotted
 snapshot_t ctx_snapshot = {		// stores the snapshot, and must only being accessed by this module (do not use in other modules)
 	.last_log_index = 0,
 	.dlen = 0,
@@ -61,6 +62,34 @@ snapshot_t xapp_snapshot = {	// this is returned by this module and can be used 
 
 pthread_mutex_t ctx_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t in_progress_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+	Used only for testing purposes
+*/
+int *get_in_progress( ) {
+	return &in_progress;
+}
+
+/*
+	Used only for testing purposes
+*/
+ctx_metabuf_t *get_ctx_metabuf( ) {
+	return &ctx_metabuf;
+}
+
+/*
+	Used only for testing purposes
+*/
+snapshot_t *get_ctx_snapshot( ) {
+	return &ctx_snapshot;
+}
+
+/*
+	Used only for testing purposes
+*/
+primary_ctx_t *get_primary_ctxs( ) {
+	return &pctxs;
+}
 
 /*
 	Returns the last snapshot taken from this xApp, or NULL if no snapshot has been taken yet
@@ -105,40 +134,41 @@ snapshot_t *get_xapp_snapshot( ) {
 void primary_ctx_handler( hashtable_t *table, const char *key ) {
 	int is_primary;
 
-	if( ( ctx.size == ctx.len ) || ( ctx.len == 0 ) ) {
-		ctx.size *= 2;		// double the size
-		ctx.contexts = (char **) realloc( ctx.contexts, ctx.size * sizeof(char *) );
-		if( ctx.contexts == NULL ) {
-			logger_fatal( "unable to allocate memory to store contexts on snapshotting (%s)", strerror( errno ) );
-			exit( 1 );
-		}
-	}
-
 	is_primary = *(int *) hashtable_get( table, key );
 	if( is_primary ) {
-		ctx.contexts[ctx.len] = strdup( key );
-		if( ctx.contexts[ctx.len] == NULL ) {
+
+		if( pctxs.size == pctxs.len ) {	// check if it has enough room
+			pctxs.size *= 2;			// double the size
+			pctxs.contexts = (char **) realloc( pctxs.contexts, pctxs.size * sizeof(char *) );
+			if( pctxs.contexts == NULL ) {
+				logger_fatal( "unable to reallocate memory to store contexts for snapshotting (%s)", strerror( errno ) );
+				exit( 1 );
+			}
+		}
+
+		pctxs.contexts[pctxs.len] = strdup( key );
+		if( pctxs.contexts[pctxs.len] == NULL ) {
 			logger_fatal( "unable to duplicate the context key to take snapshot (%s)", strerror( errno ) );
 			exit( 1 );
 		}
 
-		ctx.len++;
+		pctxs.len++;
 	}
 }
 
 static inline void free_contexts( ) {
 	unsigned int i;
 
-	for( i = 0; i < ctx.len; i++ ) {
-		free( ctx.contexts[i] );
+	for( i = 0; i < pctxs.len; i++ ) {
+		free( pctxs.contexts[i] );
 	}
 
-	free( ctx.contexts );
+	free( pctxs.contexts );
 }
 
 /*
 	Generic function to write any amount of data to a pipe
-	
+
 	Params:
 		writefd: the write file descriptor from the pipe
 		src: a pointer to the data to copy to the pipe
@@ -146,7 +176,7 @@ static inline void free_contexts( ) {
 
 	Returns 1 if all bytes were copied to the pipe
 	Returns 0 on error
-	
+
 */
 static inline int write_pipe( int writefd, void *src, size_t len ) {
 	ssize_t bytes;
@@ -183,7 +213,7 @@ static inline int write_pipe( int writefd, void *src, size_t len ) {
 
 /*
 	Generic function to read any amount of data from a pipe
-	
+
 	Params:
 		readfd: the read file descriptor from the pipe
 		dest: an allocated pointer to copy the data into
@@ -192,7 +222,7 @@ static inline int write_pipe( int writefd, void *src, size_t len ) {
 
 	Returns 1 if all bytes were copied into dest
 	Returns 0 on error, and the dest pointer remains untouched
-	
+
 */
 static inline int read_pipe( int readfd, void *dest, size_t len ) {
 	ssize_t bytes;
@@ -256,7 +286,6 @@ static inline void unlock_resources( ) {
 */
 void *parent_thread( ) {
 	int exit_status;			// exit status of the child
-	ctx_metabuf_t ctx_metabuf;
 
 	close( ctx_pipe[1] );		// closing write fd
 
@@ -275,6 +304,13 @@ void *parent_thread( ) {
 			ctx_snapshot.dlen = ctx_metabuf.dlen;
 			ctx_snapshot.items = ctx_metabuf.items;
 
+			/*
+				LOG compaction
+				do log compation here, before finalizing the snapshot and changing the in_progress variable
+				In this way, the other threads won't start a new snapshot while there is another snapshot in progress
+			*/
+			compact_server_log( );
+
 			logger_warn( "===== snapshot ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_snapshot.last_log_index,
 					ctx_snapshot.items, ctx_snapshot.dlen, *(long *) ctx_snapshot.data );
 
@@ -289,13 +325,6 @@ void *parent_thread( ) {
 	}
 
 	close( ctx_pipe[0] );		// closing read fd
-
-	/*
-		LOG compaction
-		do log compation here, before finalizing the snapshot and changing the in_progress variable
-		In this way, the other threads won't start a new snapshot while there is another snapshot in progress
-	*/
-	compact_server_log( );
 
 	pthread_mutex_lock( &in_progress_lock );
 	in_progress = 0;		// changing the snapshot status to "not in progress"
@@ -330,7 +359,6 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 	int exit_status;			// exit status of the child
 	pid_t pid;
 	unsigned char *data = NULL;	// serialized data
-	ctx_metabuf_t ctx_metabuf;
 	pthread_t th_id;
 
 	assert( ctxtable != NULL );
@@ -347,7 +375,7 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 			this status will be reverted by the parent thread
 		*/
 		in_progress = 1;
-		
+
 		pthread_mutex_unlock( &in_progress_lock );
 
 	} else {
@@ -369,19 +397,32 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 		exit( 1 );
 	}
 
-	if( pid == 0 ) {		// child process, writes to the pipe
+	if( pid > 0 ) {		// parent process, reads from the pipe
+		// no longer needed since the resources are unlocked by the caller function
+		// unlock_resources( );
+
+		if( pthread_create( &th_id, NULL, parent_thread, NULL ) != 0 ) {
+			logger_fatal( "unable to create thread in parent process to wait for the snapshot" );
+			exit( 1 );
+		}
+
+	} else {		// child process, writes to the pipe
 		unlock_resources( );
 
 		exit_status = EXIT_SUCCESS;
 
 		close( ctx_pipe[0] );	// closing read fd
 
-		ctx.size = 32;			// we are doubling it on the primary_ctx_handler, so we start with 64 elements
-		ctx.len = 0;
-
+		pctxs.size = 64;
+		pctxs.len = 0;
+		pctxs.contexts = (char **) malloc( pctxs.size * sizeof( char *) );
+		if( pctxs.contexts == NULL ) {
+			logger_fatal( "unable to allocate memory to store contexts for snapshotting (%s)", strerror( errno ) );
+			exit( 1 );
+		}
 		hashtable_foreach_key( ctxtable, primary_ctx_handler );					// iterate over all keys running handler function
 
-		ctx_metabuf.dlen = take_snapshot_cb( ctx.contexts, ctx.len, &ctx_metabuf.items, &data );	// calling take snapshot function in the xapp code
+		ctx_metabuf.dlen = take_snapshot_cb( pctxs.contexts, pctxs.len, &ctx_metabuf.items, &data );	// calling take snapshot function in the xapp code
 
 		ctx_metabuf.last_log_index = get_server_last_log_index( );
 
@@ -409,14 +450,5 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 
 		_exit( exit_status );	// terminates the child process
 
-	} else {					// parent process, reads from the pipe
-
-		// no longer needed since the resources are unlocked by the caller function
-		// unlock_resources( );
-
-		if( pthread_create( &th_id, NULL, parent_thread, NULL ) != 0 ) {
-			logger_fatal( "unable to create thread in parent process to wait for the snapshot" );
-			exit( 1 );
-		}
 	}
 }

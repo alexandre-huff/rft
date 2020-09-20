@@ -79,7 +79,7 @@ static inline hashtable_t *hashtable_new( hkey_t key_type, size_t size ) {
 	if( table != NULL ) {
 		table->size = size;
 
-		table->elem_list = malloc( size * sizeof( htelem_t ) );
+		table->elem_list = (htelem_t **) malloc( size * sizeof( htelem_t ) );
 		if( table->elem_list == NULL ) {
 			free( table );
 			return NULL;
@@ -195,7 +195,7 @@ static inline int hashtable_insert( hashtable_t *table, const char *key, void *v
 static inline void *hashtable_delete( hashtable_t *table, const char *key ) {
 	unsigned long hash;
 	htelem_t *elem;
-	char *value;
+	void *value;
 
 	if( table == NULL ) {
 		errno = EINVAL;
