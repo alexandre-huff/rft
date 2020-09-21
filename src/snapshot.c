@@ -311,7 +311,7 @@ void *parent_thread( ) {
 			*/
 			compact_server_log( );
 
-			logger_warn( "===== snapshot ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_snapshot.last_log_index,
+			logger_debug( "===== snapshot ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_snapshot.last_log_index,
 					ctx_snapshot.items, ctx_snapshot.dlen, *(long *) ctx_snapshot.data );
 
 		} else {
@@ -426,7 +426,7 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 
 		ctx_metabuf.last_log_index = get_server_last_log_index( );
 
-		logger_warn( "===== child    ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_metabuf.last_log_index,
+		logger_debug( "===== child    ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_metabuf.last_log_index,
 					ctx_metabuf.items, ctx_metabuf.dlen, *(long *) data );
 
 		if( write_pipe( ctx_pipe[1], &ctx_metabuf, sizeof(ctx_metabuf_t) ) ) {	// writing snapshot metadata

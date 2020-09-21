@@ -108,6 +108,19 @@ static inline logring_t *log_ring_create( u_int32_t size ) {
 }
 
 /**
+ * @brief Returns the size (capacity) of the ring.
+ *
+ * The usable ring size is actually size-1, in order to differ from a full and an empty ring.
+ *
+ * @param ring a pointer to the ring
+ * @return the total number of buckets of the ring
+ */
+static inline u_int32_t log_ring_size( logring_t *ring ) {
+	assert( ring != NULL );
+	return ring->mask;
+}
+
+/**
  * @brief Returns the number of log entries stored in the ring.
  *
  * @param ring a pointer to the ring

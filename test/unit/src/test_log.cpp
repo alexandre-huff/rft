@@ -45,6 +45,7 @@ extern "C" {
 TEST_GROUP( TestInitLog ) {
 	log_entries_t *raft_log = get_raft_log( );
 	log_entries_t *server_log = get_server_log( );
+	int log_size = 32;
 
 	void setup() {
 
@@ -65,46 +66,50 @@ TEST_GROUP( TestInitLog ) {
 
 TEST( TestInitLog, InitRaftLog ) {
 	int ret;
+	int ring_mask = log_size - 1;
 
 	// invalid size
 	ret = init_log( RAFT_LOG, 0, 10 );
 	LONGS_EQUAL( EINVAL, errno );
 	CHECK_FALSE( ret );
 
-	// invalid threshold size
-	ret = init_log( RAFT_LOG, 32, 0 );
+	// invalid memory threshold size
+	ret = init_log( RAFT_LOG, log_size, 0 );
 	LONGS_EQUAL( EINVAL, errno );
 	CHECK_FALSE( ret );
 
 	// valid arguments
-	ret = init_log( RAFT_LOG, 32, 10 );
+	ret = init_log( RAFT_LOG, log_size, 10 );
 	CHECK_TRUE( ret );
 	UNSIGNED_LONGS_EQUAL( 1, raft_log->first_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, raft_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
-	UNSIGNED_LONGS_EQUAL( 10 * 1048576, raft_log->threshold );	// convert Mbytes to bytes
+	UNSIGNED_LONGS_EQUAL( 10 * 1048576, raft_log->mthresh );	// convert Mbytes to bytes
+	UNSIGNED_LONGS_EQUAL( (index_t)( ring_mask * LOG_COUNT_RATIO ), raft_log->cthresh );
 }
 
 TEST( TestInitLog, InitServerLog ) {
 	int ret;
+	int ring_mask = log_size - 1;
 
 	// invalid size
 	ret = init_log( SERVER_LOG, 0, 10 );
 	LONGS_EQUAL( EINVAL, errno );
 	CHECK_FALSE( ret );
 
-	// invalid threshold size
-	ret = init_log( SERVER_LOG, 32, 0 );
+	// invalid memory threshold size
+	ret = init_log( SERVER_LOG, log_size, 0 );
 	LONGS_EQUAL( EINVAL, errno );
 	CHECK_FALSE( ret );
 
 	// valid arguments
-	ret = init_log( SERVER_LOG, 32, 10 );
+	ret = init_log( SERVER_LOG, log_size, 10 );
 	CHECK_TRUE( ret );
 	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, server_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, server_log->memsize );
-	UNSIGNED_LONGS_EQUAL( 10 * 1048576, server_log->threshold );	// convert Mbytes to bytes
+	UNSIGNED_LONGS_EQUAL( 10 * 1048576, server_log->mthresh );	// convert Mbytes to bytes
+	UNSIGNED_LONGS_EQUAL( (index_t)( ring_mask * LOG_COUNT_RATIO ), server_log->cthresh );
 }
 
 TEST_GROUP( TestLog ) {
@@ -114,6 +119,7 @@ TEST_GROUP( TestLog ) {
 	server_conf_cmd_data_t config_data;	// RAFT_CONFIG data
 	log_entries_t *raft_log = get_raft_log( );
 	log_entries_t *server_log = get_server_log( );
+	int size = 64;
 
 	void setup() {
 		entry = NULL;
@@ -122,8 +128,8 @@ TEST_GROUP( TestLog ) {
 		snprintf( config_data.server_id, sizeof(server_id_t), "%s", server );
 		snprintf( config_data.target, sizeof(server_id_t), "%s", target );
 
-		init_log( RAFT_LOG, 64, 10 );
-		init_log( SERVER_LOG, 64, 10 );
+		init_log( RAFT_LOG, size, 10 );
+		init_log( SERVER_LOG, size, 10 );
 		raft_log->first_log_index = 1;
 		raft_log->last_log_index = 0;
 		raft_log->memsize = 0;
@@ -338,7 +344,7 @@ TEST( TestLog, AppendServerLogEntry ) {
 	UNSIGNED_LONGS_EQUAL( 1, server_log->last_log_index );	// we added the first log entry
 }
 
-TEST( TestLog, AppendServerLogEntry_TakeSnapshot ) {
+TEST( TestLog, AppendServerLogEntry_TakeSnapshotLogMemory ) {
 	int command = 1;
 	int cmd_data = 50;
 	hashtable_t htable;
@@ -347,7 +353,7 @@ TEST( TestLog, AppendServerLogEntry_TakeSnapshot ) {
 	CHECK( entry != NULL );
 
 	server_log->memsize = 1025;
-	server_log->threshold = 1024;
+	server_log->mthresh = 1024;
 
 	mock()
 		.expectOneCall( "take_xapp_snapshot" )
@@ -359,6 +365,30 @@ TEST( TestLog, AppendServerLogEntry_TakeSnapshot ) {
 	mock().checkExpectations();
 
 	UNSIGNED_LONGS_EQUAL( 1, server_log->last_log_index );	// we added the first log entry
+}
+
+TEST( TestLog, AppendServerLogEntry_TakeSnapshotLogCount ) {
+	int command = 1;
+	int cmd_data = 50;
+	hashtable_t htable;
+
+	server_log->cthresh = 1;
+
+	mock()
+		.expectOneCall( "take_xapp_snapshot" )
+		.withPointerParameter( "ctxtable", &htable )
+		.withPointerParameter( "take_snapshot_cb", (take_snapshot_cb_t *) take_snapshot );
+
+	for( int i = 0; i < 3; i++ ) {
+		entry = new_server_log_entry( "myctx", "mykey", command, &cmd_data, sizeof(cmd_data) );
+		CHECK( entry != NULL );
+
+		append_server_log_entry( entry, &htable, take_snapshot );
+	}
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 3, server_log->last_log_index );	// we added the three log entries
 }
 
 /* ===================================== Next group of tests ===================================== */

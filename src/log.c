@@ -52,7 +52,8 @@ pthread_mutex_t server_log_lock = PTHREAD_MUTEX_INITIALIZER;	// mutex for lockin
 */
 static log_entries_t raft_log = {
 	.memsize = 0,
-	.threshold = 1024,
+	.mthresh = 1024,
+	.cthresh = 0,
 	.first_log_index = 1,
 	.last_log_index = 0,
 	.entries = NULL
@@ -64,7 +65,8 @@ static log_entries_t raft_log = {
 */
 static log_entries_t xapp_log = {
 	.memsize = 0,
-	.threshold = 1024,
+	.mthresh = 1024,
+	.cthresh = 0,
 	.first_log_index = 1,
 	.last_log_index = 0,
 	.entries = NULL
@@ -122,14 +124,16 @@ int init_log( log_type_e type, u_int32_t size, u_int32_t threshold ) {
 		if( raft_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
-		raft_log.threshold = threshold * 1048576;	// convert Mbytes to bytes
+		raft_log.mthresh = threshold * 1048576;	// convert Mbytes to bytes
+		raft_log.cthresh = (index_t)( log_ring_size( raft_log.entries ) * LOG_COUNT_RATIO );
 
 	} else if( type == SERVER_LOG && threshold > 0 ) {
 		xapp_log.entries = log_ring_create( size );
 		if( xapp_log.entries == NULL ) {
 			return 0;	// errno is already set
 		}
-		xapp_log.threshold = threshold * 1048576;	// convert Mbytes to bytes
+		xapp_log.mthresh = threshold * 1048576;	// convert Mbytes to bytes
+		xapp_log.cthresh = (index_t)( log_ring_size( xapp_log.entries ) * LOG_COUNT_RATIO );
 
 	} else {
 		errno = EINVAL;	// invalid log type
@@ -222,8 +226,6 @@ void append_raft_log_entry( log_entry_t *log_entry ) {
 
 	This is for the xApp state replication log entries
 
-	max_log_size: the maximum size the server log can grow before taking a snapshot (in Mbytes)
-
 	Sets the log_index of the new log entry according to its position in the log
 */
 void append_server_log_entry( log_entry_t *log_entry, hashtable_t *ctxtable, take_snapshot_cb_t take_xapp_snapshot_cb ) {
@@ -231,7 +233,7 @@ void append_server_log_entry( log_entry_t *log_entry, hashtable_t *ctxtable, tak
 
 	pthread_mutex_lock( &server_log_lock );
 
-	if( xapp_log.memsize > xapp_log.threshold )
+	if( ( xapp_log.memsize > xapp_log.mthresh ) || ( log_ring_count(xapp_log.entries) > xapp_log.cthresh ) )
 		take_xapp_snapshot( ctxtable, take_xapp_snapshot_cb );
 
 	// wrapper as same as append raft log entry
@@ -817,7 +819,7 @@ void compact_server_log( ) {
 	pthread_mutex_lock( &server_log_lock );
 	xapp_log.first_log_index = to_index;	// first_log_index is the next valid log entry (to_index was incremented before the loop)
 
-	logger_warn( "server logs compacted, remaining entries: %lu, size: %.3f mb",
+	logger_info( "server logs compacted, remaining entries: %lu, size: %.3f mb",
 				xapp_log.last_log_index - xapp_log.first_log_index + 1, xapp_log.memsize / (float)1048576 ); // bytes to Mbytes
 
 	pthread_mutex_unlock( &server_log_lock );

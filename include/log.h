@@ -35,6 +35,7 @@
 
 #define RAFT_LOG_SIZE	512		// size of the ring to store raft log entries (power of 2)
 #define SERVER_LOG_SIZE	131072	// size of the ring to store server (xApp) log entries (power of 2)
+#define LOG_COUNT_RATIO	0.8		// count ratio of the number of log entries to trigger a snapshot (between 0 and 1)
 
 int init_log( log_type_e type, u_int32_t size, u_int32_t threshold );
 log_entries_t *get_raft_log( );		// testing purposes

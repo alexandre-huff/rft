@@ -231,7 +231,8 @@ typedef struct log_entry {
 */
 typedef struct log_entries {
 	size_t memsize;				// memory size (in bytes) of all log entries stored in the *entries ring (data and metadata)
-	size_t threshold;			// defines the threshold (in bytes) to trigger the corresponding snapshot function
+	size_t mthresh;				// defines the memory threshold (in bytes) to trigger the corresponding snapshot function
+	index_t cthresh;			// defines the entries count threshold to trigger the corresponding snapshot function
 	index_t first_log_index;	// the first index of the stored log entries (used for snapshotting)
 	index_t last_log_index;		// the index of the last log saved in entries
 	logring_t *entries;			// ring buffer pointing to the log entries
