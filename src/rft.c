@@ -456,7 +456,8 @@ int rft_rts_msg( rmr_mbuf_t **msg, int mtype, int payload_size, server_id_t *ser
 	int retries = MAX_RMR_RETRIES;
 
 	if( payload_size > max_msg_size ) {
-		logger_error( "unable to reply message type %d, reason: payload_size (%d) > max_msg_size (%d)", mtype, payload_size, max_msg_size );
+		logger_error( "unable to reply message type %d to server %s, reason: payload_size (%d) > max_msg_size (%d)",
+					mtype, server_id, payload_size, max_msg_size );
 		return 0;
 	}
 
@@ -465,7 +466,8 @@ int rft_rts_msg( rmr_mbuf_t **msg, int mtype, int payload_size, server_id_t *ser
 	(*msg)->len = payload_size;
 	(*msg)->state = RMR_OK;
 
-	logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p", LOGGER_PADDING, "replying message", mtype, payload_size, mrc, *(msg) );
+	logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p, server: %s",
+				LOGGER_PADDING, "replying message", mtype, payload_size, mrc, *(msg), server_id );
 
 	(*msg) = rmr_rts_msg( mrc, (*msg) );
 	while ((*msg) && (*msg)->state == RMR_ERR_RETRY && retries ) {
@@ -475,10 +477,11 @@ int rft_rts_msg( rmr_mbuf_t **msg, int mtype, int payload_size, server_id_t *ser
 	}
 
 	if ( (*msg)->state == RMR_ERR_RETRY ) {
-			logger_warn( "message dropped with state RMR_ERR_RETRY, target: %s, mtype: %d", server_id, mtype );
+			logger_warn( "message dropped with state RMR_ERR_RETRY, server: %s, mtype: %d", server_id, mtype );
 			replied = 0;
 	} else if ( (*msg)->state != RMR_OK ) {
-			logger_warn( "reply failed, mtype: %d, target: %s, state: %d, strerr: %s", mtype, server_id, (*msg)->state, strerror( errno ) );
+			logger_warn( "reply failed, mtype: %d, server: %s, state: %d, strerr: %s",
+						mtype, server_id, (*msg)->state, strerror( errno ) );
 			replied = 0;
 	}
 
@@ -507,7 +510,8 @@ int rft_send_wh_msg( rmr_mbuf_t **msg, rmr_whid_t whid, int mtype, int payload_s
 	(*msg)->len = payload_size;
 	(*msg)->state = RMR_OK;
 
-	logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p", LOGGER_PADDING, "sending wh message", mtype, (*msg)->len, mrc, *(msg) );
+	logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p, server: %s",
+				LOGGER_PADDING, "sending wh message", mtype, (*msg)->len, mrc, *(msg), server_id );
 
 	(*msg) = rmr_wh_send_msg( mrc, whid, (*msg) );
 
@@ -518,16 +522,19 @@ int rft_send_wh_msg( rmr_mbuf_t **msg, rmr_whid_t whid, int mtype, int payload_s
 	}
 
 	if ( (*msg)->state == RMR_ERR_RETRY ) {
-			logger_warn( "message dropped with state RMR_ERR_RETRY, target: %s, mtype: %d", server_id, mtype );
-			logger_trace( "message dropped with state RMR_ERR_RETRY, target: %s, mtype: %d, mrc: %p, msg: %p ", server_id, mtype, mrc, (*msg) );
+			logger_warn( "message dropped with state RMR_ERR_RETRY, server: %s, mtype: %d", server_id, mtype );
+			logger_trace( "message dropped with state RMR_ERR_RETRY, mtype: %d, mrc: %p, msg: %p, server: %s",
+						mtype, mrc, (*msg), server_id );
 			sent = 0;
 	} else if ( (*msg)->state != RMR_OK ) {
-			logger_warn( "send failed, mtype: %d, target: %s, state: %d, strerr: %s", mtype, server_id, (*msg)->state, strerror( errno ) );
+			logger_warn( "send failed, mtype: %d, server: %s, state: %d, strerr: %s",
+						mtype, server_id, (*msg)->state, strerror( errno ) );
 			sent = 0;
 	}
 
 	if( sent )
-		logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p", LOGGER_PADDING, "message sent", mtype, (*msg)->len, mrc, (*msg) );
+		logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p, server: %s",
+					LOGGER_PADDING, "message sent", mtype, (*msg)->len, mrc, (*msg), server_id );
 
 	return sent;
 }
@@ -1749,7 +1756,7 @@ void *trigger_election_timeout( ) {
 }
 
 /*
-	This function is in charge of getting a message from the task queue
+	This function is in charge of getting a message from the task ring
 	and dispatch it according to the message type
 */
 void *worker( ) {
@@ -1861,7 +1868,7 @@ void *worker( ) {
 				logger_debug( "replying  replication request to %s, replica_index: %lu, success: %d",
 								rep_req_msg.server_id, rep_reply_msg->replica_index, rep_reply_msg->success );
 
-				rft_rts_msg( &msg, REPLICATION_REPLY, sizeof( *rep_reply_msg ), &rep_reply_msg->server_id );
+				rft_rts_msg( &msg, REPLICATION_REPLY, sizeof( *rep_reply_msg ), &rep_req_msg.server_id );
 
 				// freeing uneeded deserialized log entries after applying xapp's state
 				for( i = 0; i < rep_req_msg.n_entries; i++ ) {
@@ -1953,7 +1960,7 @@ void *worker( ) {
 				logger_warn( "replying snapshot request to %s, type: %d, replica_index: %lu, success: %d", req_snapshot_msg.server_id,
 											reply_snapshot_msg->type, reply_snapshot_msg->last_log_index, reply_snapshot_msg->success );
 
-				rft_rts_msg( &msg, SNAPSHOT_REPLY, sizeof(snapshot_reply_t), &reply_snapshot_msg->server_id );
+				rft_rts_msg( &msg, SNAPSHOT_REPLY, sizeof(snapshot_reply_t), &req_snapshot_msg.server_id );
 				break;
 
 			case SNAPSHOT_REPLY:

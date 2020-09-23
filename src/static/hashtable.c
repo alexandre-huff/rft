@@ -71,6 +71,9 @@ static inline int equals( hkey_t key_type, htelem_t *elem, const char *key ) {
 
 	They pointer to the key type must be of the same type in
 	all subsequent operations with the returned pointer
+
+	size: best if prime number
+
 */
 static inline hashtable_t *hashtable_new( hkey_t key_type, size_t size ) {
 	hashtable_t *table;

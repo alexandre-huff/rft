@@ -113,7 +113,7 @@ log_entries_t *get_server_log( ) {
 
 	Paramenters:
 	type: defines the type of the log (i.e. RAFT_LOG or SERVER_LOG)
-	size: defines the size of the ring to store log entries (needs to be a prime number)
+	size: defines the size of the ring to store log entries (needs to be power of 2)
 	threshold: defines the threshold of the log (in Mbytes) to trigger the snapshot function
 
 	Returns 1 on success. On error, 0 is returned and errno is set to indicate the error.
