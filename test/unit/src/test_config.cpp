@@ -28,9 +28,14 @@
 
 #include "CppUTest/TestHarness.h"
 // #include "CppUTest/TestHarness_c.h"
+#include "CppUTestExt/MockSupport.h"
 
 extern "C" {
+	#include <arpa/inet.h>
 	#include "config.h"
+	#include "snapshot.h"
+	#include "log.h"
+	#include "types.h"
 	#include "stubs/stub_logger.h"
 	#include "stubs/stub_rft.h"
 	#include "stubs/stub_pthread.h"
@@ -39,12 +44,12 @@ extern "C" {
 
 TEST_GROUP( TestConfig ) {
 	server_id_t server_id;
-	char target[64];
+	target_t target;
 	raft_config_t *config = raft_get_config( );
 
 	void setup() {
 		snprintf( server_id, sizeof(server_id_t), "server1" );
-		snprintf( target, 64, "127.0.0.1:4560" );
+		snprintf( target, sizeof(target_t), "127.0.0.1:4560" );
 	}
 
 	void teardown() {
@@ -69,7 +74,7 @@ TEST( TestConfig, RaftConfigAddServer ) {
 	LONGS_EQUAL( 0, ret );
 
 	// adding a server with correct arguments
-	ret = raft_config_add_server( &server_id, target, last_log_index );
+	ret = raft_config_add_server( &server_id, &target, last_log_index );
 	LONGS_EQUAL( 1, ret );
 	LONGS_EQUAL( 1, config->size );
 	LONGS_EQUAL( 0, config->voting_members );
@@ -92,7 +97,7 @@ TEST( TestConfig, RaftConfigAddServer ) {
 
 	// trying to add a server that is stored in the configuration
 	last_log_index = 5;
-	ret = raft_config_add_server( &server_id, target, last_log_index );
+	ret = raft_config_add_server( &server_id, &target, last_log_index );
 	LONGS_EQUAL( 0, ret );
 	LONGS_EQUAL( 1, config->size );				// cannot change
 	LONGS_EQUAL( 0, config->voting_members );	// cannot change
@@ -116,7 +121,7 @@ TEST_GROUP( TestConfigInitialized ) {
 	void setup() {
 		snprintf( server_id, sizeof(server_id_t), "server1" );
 		snprintf( target, 64, "127.0.0.1:4560" );
-		int ret = raft_config_add_server( &server_id, target, 0 );
+		int ret = raft_config_add_server( &server_id, &target, 0 );
 		LONGS_EQUAL( 1, ret );
 	}
 
@@ -146,7 +151,10 @@ TEST( TestConfigInitialized, RaftConfigGetServer ) {
 	STRCMP_EQUAL( target, server->target );
 }
 
-TEST( TestConfigInitialized, RaftConfigRemoveServer ) {
+/*
+	Removig a voting member
+*/
+TEST( TestConfigInitialized, RaftConfigRemoveVotingServer ) {
 
 	server_t *server = raft_config_get_server( &server_id );
 	CHECK( server != NULL );
@@ -156,13 +164,37 @@ TEST( TestConfigInitialized, RaftConfigRemoveServer ) {
 	raft_config_set_server_status( &server_id, VOTING_MEMBER );
 
 	raft_config_remove_server( &server_id );
-	config->size = 0;
-	config->voting_members = 0;	// checking voting members
-	config->is_changing = 0;
+	UNSIGNED_LONGS_EQUAL( 0, config->size );
+	UNSIGNED_LONGS_EQUAL( 0, config->voting_members );	// checking voting members
+	LONGS_EQUAL( SHUTDOWN, server->active );			// checks if the raft_server thread will finalize
 
 	/*
 		we have to free here, since in the real implementation the
-		server's thread deallocate its memory
+		raft_server thread deallocate its own memory
+	*/
+	free( server );
+}
+
+/*
+	Removig a non voting member
+*/
+TEST( TestConfigInitialized, RaftConfigRemoveNonVotingServer ) {
+
+	server_t *server = raft_config_get_server( &server_id );
+	CHECK( server != NULL );
+	server->active = RUNNING;
+
+	// needed to check if non voting member won't be decreased on removing the server
+	raft_config_set_server_status( &server_id, NON_VOTING_MEMBER );
+
+	raft_config_remove_server( &server_id );
+	UNSIGNED_LONGS_EQUAL( 0, config->size );
+	UNSIGNED_LONGS_EQUAL( 0, config->voting_members );	// checking voting members
+	LONGS_EQUAL( SHUTDOWN, server->active );			// checks if the raft_server thread will finalize
+
+	/*
+		we have to free here, since in the real implementation the
+		raft_server thread deallocate its own memory
 	*/
 	free( server );
 }
@@ -280,16 +312,18 @@ TEST( TestConfigInitialized, IsServerCaughtUp ) {
 TEST_GROUP( TestConfigThreeServers ) {
 	static const int max_servers = 3;
 	server_id_t server_id[max_servers];
-	char target[max_servers][64];
+	target_t target[max_servers];
 	raft_config_t *config = raft_get_config( );
 
 	void setup() {
-		int ret;
+		int success;
 		for( int i = 0; i < max_servers; i++ ) {
 			snprintf( server_id[i], sizeof(server_id_t), "server%d", i + 1 );
-			snprintf( target[i], 64, "127.0.0.%d:4560", i + 1 );
-			ret = raft_config_add_server( &server_id[i], target[i], 0 );
-			LONGS_EQUAL( 1, ret );
+			snprintf( &(*target[i]), sizeof(target_t), "127.0.0.%d:4560", i + 1 );
+			success = raft_config_add_server( &server_id[i], &target[i], 0 );
+			if( !success ) {
+				FAIL( "unable to add a new server to the Raft configuration" );
+			}
 		}
 	}
 
@@ -423,4 +457,148 @@ TEST( TestConfigThreeServers, GetReplicaServers ) {
 
 TEST( TestConfigThreeServers, RaftGetNumServers ) {
 	LONGS_EQUAL( config->size, raft_get_num_servers( ) );
+}
+
+TEST_GROUP( RaftSnapshot ) {
+	static const int num_servers = 2;
+	server_id_t server_id[num_servers];
+	target_t target[num_servers];
+	raft_config_t *config = raft_get_config( );
+	unsigned char *data = NULL;	// stores all the configuration of all raft servers
+	pipe_metabuf_t metadata;
+
+	void setup() {
+		int success;
+		for( int i = 0; i < num_servers; i++ ) {
+			snprintf( server_id[i], sizeof(server_id_t), "server%d", i + 1 );
+			snprintf( &(*target[i]), sizeof(target_t), "127.0.0.%d:4560", i + 1 );
+			success = raft_config_add_server( &server_id[i], &target[i], 0 );
+			if( !success ) {
+				FAIL( "unable to add a new server to the Raft configuration" );
+			}
+			raft_config_set_server_status( &server_id[i], VOTING_MEMBER );
+			config->servers[i]->active = RUNNING;	// required to remove the server from the configuration
+		}
+
+		metadata.dlen = 0;
+		metadata.items = 0;
+		metadata.last_index = 0;
+		metadata.last_term = 0;
+	}
+
+	void teardown() {
+		for( int i = 0; i < config->size; i++ ) {
+			free( config->servers[i] );
+		}
+		free( config->servers );
+		config->servers = NULL;
+		config->is_changing = 0;
+		config->size = 0;
+		config->voting_members = 0;
+		if( data ) {
+			free( data );
+			data = NULL;
+		}
+		mock().clear();
+	}
+
+};
+
+TEST( RaftSnapshot, CreateSnapshot ) {
+	raft_server_snapshot_t *rserver;	// snapshot item (i.e. a server)
+
+	mock()
+		.expectOneCall( "get_raft_last_applied" )
+		.andReturnValue( num_servers );
+	mock()
+		.expectOneCall( "get_raft_current_term" )
+		.andReturnValue( 1 );
+
+	create_raft_config_snapshot( &data, &metadata );
+	mock().checkExpectations();
+
+	rserver = (raft_server_snapshot_t *) data;
+	for( int i = 0; i < num_servers; i++ ) {
+		STRCMP_EQUAL( config->servers[i]->server_id, rserver[i].server_id );
+		STRCMP_EQUAL( config->servers[i]->target, rserver[i].target );
+		LONGS_EQUAL( htonl( config->servers[i]->status ), rserver[i].status );
+	}
+
+	UNSIGNED_LONGS_EQUAL( config->size, metadata.items );
+	UNSIGNED_LONGS_EQUAL( num_servers, metadata.last_index );
+	UNSIGNED_LONGS_EQUAL( 1, metadata.last_term );
+	UNSIGNED_LONGS_EQUAL( num_servers * sizeof(raft_server_snapshot_t), metadata.dlen );
+}
+
+TEST( RaftSnapshot, CommitSnapshot ) {
+	raft_server_snapshot_t *rserver;
+	raft_snapshot_t snapshot;
+	log_entries_t raft_log;
+	server_t **old_servers;
+
+	// simulating a snapshot from here
+	data = (unsigned char *) malloc( num_servers * sizeof(raft_server_snapshot_t) );
+	if( !data )
+		FAIL( "unable to allocate memory to store the raft snapshot data")
+
+	old_servers = (server_t **) malloc( num_servers * sizeof(server_t *) );
+
+	rserver = (raft_server_snapshot_t *) data;
+	for(int i = 0; i < num_servers; i++ ) {
+		// creating the snapshot data (raft configuration)
+		snprintf( rserver[i].server_id, sizeof(server_id_t), "xapp%d", i + num_servers );
+		snprintf( rserver[i].target, sizeof(target_t), "xapp%d:4560", i + num_servers );
+		rserver[i].status = (raft_voting_member_e) htonl( VOTING_MEMBER );
+
+		old_servers[i] = config->servers[i];	// we need to keep their pointers to free them later
+	}
+	// populating the metadata
+	snapshot.data = data;
+	snapshot.dlen = num_servers * sizeof(raft_server_snapshot_t);
+	snapshot.items = num_servers;
+	snapshot.last_index = 5;
+	snapshot.last_term = 2;
+	// simulating a snapshot up to here
+
+	mock()
+		.expectOneCall( "lock_raft_log" );
+	mock()
+		.expectOneCall( "get_raft_log" )
+		.andReturnValue( &raft_log );
+	mock()
+		.expectOneCall( "free_all_log_entries" )
+		.withPointerParameter( "log", &raft_log )
+		.withParameter( "last_applied_log_index", snapshot.last_index );
+	mock()
+		.expectOneCall( "set_raft_current_term" )
+		.withParameter( "term", snapshot.last_term );
+	mock()
+		.expectOneCall( "set_raft_last_applied" )
+		.withParameter( "last_applied", snapshot.last_index );
+	mock()
+		.expectOneCall( "set_raft_commit_index" )
+		.withParameter( "index", snapshot.last_index );
+	mock()
+		.expectOneCall( "update_replica_servers" );
+	mock()
+		.expectOneCall( "unlock_raft_log" );
+
+	commit_raft_config_snapshot( &snapshot );
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( num_servers, config->size );
+
+	for( int i = 0; i < num_servers; i++ ) {
+		STRCMP_EQUAL( rserver[i].server_id, config->servers[i]->server_id );
+		STRCMP_EQUAL( rserver[i].target, config->servers[i]->target );
+		LONGS_EQUAL( VOTING_MEMBER, config->servers[i]->status );
+
+		/*
+			we have to free here, since in the real implementation the
+			raft_server thread deallocate its own memory
+		*/
+		free( old_servers[i] );
+	}
+
+	free( old_servers );
 }

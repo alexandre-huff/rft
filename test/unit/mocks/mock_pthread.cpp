@@ -19,21 +19,28 @@
 */
 
 /*
-	Mnemonic:	stub_utils.h
-	Abstract:	Provides stub functions of the utils module to build RFT tests
+	Mnemonic:	mock_pthread.cpp
+	Abstract:	Implements mock features of the pthread library for testing the RFT
 
-	Date:		5 September 2020
+	Date:		30 October 2020
 	Author:		Alexandre Huff
 */
 
-int randomize_election_timeout( ) {
-	return 150;
+#include "CppUTest/TestHarness.h"
+#include "CppUTestExt/MockSupport.h"
+
+extern "C" {
+	#include <pthread.h>
 }
 
-unsigned int parse_uint( char *str ) {
-	return 0;
+int pthread_create(pthread_t *__restrict__ __newthread,
+	const pthread_attr_t *__restrict__ __attr, void *(*__start_routine)(void *), void *__restrict__ __arg) {
+	return mock().actualCall(__func__)
+		.withOutputParameter( "__newthread", __newthread )
+		.withConstPointerParameter( "__attr", __attr )
+		.withPointerParameter( "__start_routine", (void *)__start_routine )
+		.withOutputParameter( "__arg", __arg )
+		.returnIntValueOrDefault( 0 );
 }
 
-int parse_int( char *str ) {
-	return 0;
-}
+

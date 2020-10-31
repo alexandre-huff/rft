@@ -45,12 +45,23 @@
 
 /* ############## Private RFT functions ############## */
 
-void *send_append_entries( void *raft_server );
-void handle_membership_request( membership_request_t *membership_msg, char *rmr_src );
+int set_max_msg_size( int size );
+void *raft_server( void *new_server );
+void handle_membership_request( membership_request_t *membership_msg, target_t *rmr_src );
+void handle_append_entries_request( request_append_entries_t *request_msg, reply_append_entries_t *response_msg);
+void handle_append_entries_reply( reply_append_entries_t *reply_msg );
 raft_state_t *get_me( );
 server_id_t *get_myself_id( );
 void set_mrc( void *_mrc );
 index_t get_full_replicated_log_index( );
+void lock_raft_state( );
+void unlock_raft_state( );
+term_t get_raft_current_term( );
+index_t get_raft_last_applied( );
+void set_raft_current_term( term_t term );
+void set_raft_last_applied( index_t last_applied );
+void set_raft_commit_index( index_t index );
+void update_replica_servers( );
 
 
 #endif

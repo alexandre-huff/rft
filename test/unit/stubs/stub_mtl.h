@@ -19,21 +19,28 @@
 */
 
 /*
-	Mnemonic:	stub_utils.h
-	Abstract:	Provides stub functions of the utils module to build RFT tests
+	Mnemonic:	stub_mtl.h
+	Abstract:	Provides stub functions of the mtl module to build RFT tests
 
-	Date:		5 September 2020
+	Date:		22 October 2020
 	Author:		Alexandre Huff
 */
 
-int randomize_election_timeout( ) {
-	return 150;
+#include "mtl.h"
+
+
+void appnd_entr_header_to_msg_cpy( appnd_entr_hdr_t *header, request_append_entries_t *msg ) {
+	return;
 }
 
-unsigned int parse_uint( char *str ) {
-	return 0;
+void repl_req_header_to_msg_cpy( repl_req_hdr_t *header, replication_request_t *msg ) {
+	return;
 }
 
-int parse_int( char *str ) {
-	return 0;
+void xapp_snapshot_header_to_msg_cpy( xapp_snapshot_hdr_t *header, xapp_snapshot_request_t *msg ) {
+	return;
+}
+
+void raft_snapshot_header_to_msg_cpy( raft_snapshot_hdr_t *header, raft_snapshot_request_t *msg ) {
+	return;
 }

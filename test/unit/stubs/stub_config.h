@@ -19,21 +19,19 @@
 */
 
 /*
-	Mnemonic:	stub_utils.h
-	Abstract:	Provides stub functions of the utils module to build RFT tests
+	Mnemonic:	stub_config.h
+	Abstract:	Provides stub functions of the config module to build RFT tests
 
-	Date:		5 September 2020
+	Date:		26 October 2020
 	Author:		Alexandre Huff
 */
 
-int randomize_election_timeout( ) {
-	return 150;
+
+void lock_raft_config( ) {
+	return;
 }
 
-unsigned int parse_uint( char *str ) {
-	return 0;
+void unlock_raft_config( ) {
+	return;
 }
 
-int parse_int( char *str ) {
-	return 0;
-}

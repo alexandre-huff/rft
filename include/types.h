@@ -41,6 +41,8 @@
 */
 typedef char server_id_t[ RMR_MAX_SRC ];
 
+typedef char target_t[ RMR_MAX_SRC ];
+
 typedef unsigned long term_t;	// defines the raft term's type
 
 typedef unsigned long index_t;	// defines the raft index's type
@@ -114,14 +116,6 @@ typedef enum replication_type {
 } replication_type_e;
 
 /*
-	Defines the type of the snapshot
-*/
-typedef enum snapshot_type {
-	RAFT_SNAPSHOT,		// raft snapshot
-	SERVER_SNAPSHOT		// xapp snapshot
-} snapshot_type_e;
-
-/*
 	Defines the particular RAFT state for the current server instance (me)
 */
 typedef struct raft_state {
@@ -153,7 +147,7 @@ typedef struct server {
 	server_id_t server_id;
 
 	/* ============= RAFT-specific from here ============= */
-	char target[RMR_MAX_SRC];		// the source:port address from that server used to send AppendEntries messages by wormholes
+	target_t target;		// the source:port address from that server used to send AppendEntries messages by wormholes
 	raft_voting_member_e status;	// defines if votes of this server are accounted for the majority (changed when processed by FSM)
 	/*
 		Defines if that member has voted for me in the current term
@@ -206,7 +200,7 @@ typedef struct config {
 */
 typedef struct server_conf_cmd_data {
 	server_id_t server_id;
-	char target[RMR_MAX_SRC];
+	target_t target;
 } server_conf_cmd_data_t;
 
 /*
@@ -233,8 +227,8 @@ typedef struct log_entries {
 	size_t memsize;				// memory size (in bytes) of all log entries stored in the *entries ring (data and metadata)
 	size_t mthresh;				// defines the memory threshold (in bytes) to trigger the corresponding snapshot function
 	index_t cthresh;			// defines the entries count threshold to trigger the corresponding snapshot function
-	index_t first_log_index;	// the first index of the stored log entries (used for snapshotting)
-	index_t last_log_index;		// the index of the last log saved in entries
+	index_t index_offset;		// points to the last compacted log index
+	index_t last_log_index;		// the index of the last log stored in log entries
 	logring_t *entries;			// ring buffer pointing to the log entries
 } log_entries_t;
 
@@ -319,26 +313,58 @@ typedef struct membership_request {
 } membership_request_t;
 
 /*
-	Defines a generic snapshot structure
+	Defines the xApp snapshot structure
 */
-typedef struct snapshot {
-	index_t last_log_index;	// snapshot index of log entry immediately preceding new ones
+typedef struct xapp_snapshot {
+	index_t last_index;		// last log index the snapshot replaces
 	size_t dlen;			// data length of the snapshot
-	unsigned int items;		// number of items in the snapshot data ( each item corresponds to: clen|context|klen|key|vlen|value )
+	/*
+		number of items in the snapshot data
+		each item corresponds to:
+		xapp: clen | context | klen | key | vlen | value
+	*/
+	unsigned int items;
 	unsigned char *data;	// pointer to the state data
-} snapshot_t;
+} xapp_snapshot_t;
 
-typedef struct snapshot_request {
-	snapshot_type_e type;		// RAFT or SERVER
+/*
+	Defines the Raft snapshot structure
+*/
+typedef struct raft_snapshot {
+	term_t last_term;		// the term the snapshot replaces
+	index_t last_index;		// last log index the snapshot replaces
+	size_t dlen;			// data length of the snapshot
+	/*
+		number of items in the snapshot data
+		each item corresponds to:
+		raft: server_id | target | raft_voting_member_e
+	*/
+	unsigned int items;
+	unsigned char *data;	// pointer to the state data
+} raft_snapshot_t;
+
+typedef struct xapp_snapshot_request {
 	server_id_t server_id;
-	snapshot_t snapshot;
-} snapshot_request_t;
+	xapp_snapshot_t snapshot;
+} xapp_snapshot_request_t;
 
-typedef struct snapshot_reply {
-	snapshot_type_e type;		// RAFT or SERVER
-	int success;				// true if server contained entry matching prev_log_index
-	index_t last_log_index;		// the highest replicated index in the server
+typedef struct xapp_snapshot_reply {
+	int success;				// true if the server snapshot has been installed
+	index_t last_index;			// last log index the snapshot replaces in the server
 	server_id_t server_id;		// identifies the server which is replying this message
-} snapshot_reply_t;
+} xapp_snapshot_reply_t;
+
+typedef struct raft_snapshot_request {
+	term_t term;
+	server_id_t leader_id;
+	raft_snapshot_t snapshot;
+} raft_snapshot_request_t;
+
+typedef struct raft_snapshot_reply {
+	int success;				// true if the raft config snapshot has been installed
+	term_t term;
+	index_t last_index;			// last log index the snapshot replaces in the raft server
+	server_id_t server_id;		// identifies the server which is replying this message
+} raft_snapshot_reply_t;
 
 #endif

@@ -148,12 +148,12 @@ void install_snapshot( unsigned int items, const unsigned char *data ) {
 	for( i = 0; i < items; i++ ) {
 		// it could be: clen|context|klen|key|vlen|value|clen|context|klen|key|vlen|value...
 		memcpy( &value, &state, vlen );
-		// might involve use of hastable to get the context and its corresponding keys
+		// might involve use of hashtable to get the context and its corresponding keys
 	} */
 	pthread_mutex_lock( &bkp_lock );
 
 	memcpy( &bkp_state, data, sizeof(long) );
-	logger_warn( "snapshot installed, bkp_state: %ld", bkp_state );
+	logger_warn( "snapshot installed, items: %u, bkp_state: %ld", items, bkp_state );
 
 	pthread_mutex_unlock( &bkp_lock );
 }
@@ -184,9 +184,11 @@ void *listener( void *mrc ) {
 				case MEMBERSHIP_REQ:
 				case REPLICATION_REQ:
 				case REPLICATION_REPLY:
-				case SNAPSHOT_REQ:
-				case SNAPSHOT_REPLY:
-					logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p", LOGGER_PADDING, "receiving message", msg->mtype, msg->len, mrc, msg );
+				case XAPP_SNAPSHOT_REQ:
+				case XAPP_SNAPSHOT_REPLY:
+				case RAFT_SNAPSHOT_REQ:
+				case RAFT_SNAPSHOT_REPLY:
+					// logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p", LOGGER_PADDING, "receiving message", msg->mtype, msg->len, mrc, msg );
 
 					#ifndef NORFT
 					rft_enqueue_msg( msg );

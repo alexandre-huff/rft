@@ -44,10 +44,10 @@ log_entries_t *get_server_log( server_id_t *server_id ) {
 	.returnPointerValue( );
 }
 
-int raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
+int raft_config_add_server( server_id_t *server_id, target_t *target, index_t last_log_index ) {
 	return mock().actualCall(__func__)
 		.withParameter("server_id", *server_id)
-		.withParameter("target", target)
+		.withParameter("target", *target)
 		.withParameter("last_log_index", last_log_index)
 		.returnIntValueOrDefault( 1 );	// if we disable mocking framework, 1 is always returned
 }
@@ -127,4 +127,23 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 unsigned int raft_get_num_servers( ) {
 	return (unsigned int)mock().actualCall(__func__)
 		.returnUnsignedIntValue();
+}
+
+void create_raft_config_snapshot( unsigned char **data, pipe_metabuf_t *raft_metadata ) {
+	mock().actualCall(__func__)
+		.withOutputParameter( "data", data )
+		.withOutputParameter( "raft_metadata", raft_metadata );
+}
+
+void commit_raft_config_snapshot( raft_snapshot_t *snapshot  ) {
+	mock().actualCall(__func__)
+		.withPointerParameter( "snapshot", snapshot );
+}
+
+void lock_raft_config( ) {
+	mock().actualCall(__func__);
+}
+
+void unlock_raft_config( ) {
+	mock().actualCall(__func__);
 }

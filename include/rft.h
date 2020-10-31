@@ -42,8 +42,10 @@
 #define MEMBERSHIP_REQ			204		// Message sent from a server which is trying to join to the cluster
 #define REPLICATION_REQ			205		// Append Entries used to replicate log entries for xApps commands
 #define REPLICATION_REPLY		206		// Append Entries replication reply for xApps commands
-#define SNAPSHOT_REQ			207		// Snapshot request message
-#define SNAPSHOT_REPLY			208
+#define XAPP_SNAPSHOT_REQ		207		// xApp snapshot request message
+#define XAPP_SNAPSHOT_REPLY		208
+#define RAFT_SNAPSHOT_REQ		209		// Raft snapshot request message
+#define RAFT_SNAPSHOT_REPLY		210
 
 #define HEARTBEAT_TIMETOUT		1000	// time (ms) that a leader waits before issue a heartbeat message
 

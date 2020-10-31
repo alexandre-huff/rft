@@ -58,7 +58,7 @@ void *trigger_election_timeout( );
 void *state_replication( );
 void become_follower( );
 void become_leader( );
-static inline void raft_commit_log_entries( index_t new_commit_index );
+void raft_commit_log_entries( index_t new_commit_index );
 
 /* ############ Global constants ############ */
 static const int primary_replica = 1;	// used by the context hashtable to store the xApp's role
@@ -75,15 +75,14 @@ int rand_timeout_ms;				// defines the current election timeout in ms
 /*
 	In case of deadlocks check man page of pthread_mutex_lock looking at PTHREAD_MUTEX_ERRORCHECK
 */
-pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t raft_state_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t election_timeout_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t follower_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t leader_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t replica_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t installing_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t installing_xapp_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t installing_raft_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
 
-pthread_cond_t	tasks_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	raft_state_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	election_timeout_cond = PTHREAD_COND_INITIALIZER;
 pthread_cond_t	follower_cond = PTHREAD_COND_INITIALIZER;
@@ -125,12 +124,13 @@ static hashtable_t *ctxtab = NULL;	// hastable used to store if this xApp instan
 	defined by the user in rmr_init() function
 	we cannot send more than those bytes when using SI95 with RMR (message will be dropped on the receiver)
 */
-static int max_msg_size;
+static int max_msg_size = 0;
 
 apply_state_cb_t apply_command_cb;
 take_snapshot_cb_t take_xapp_snapshot_cb;
 install_snapshot_cb_t install_xapp_snapshot_cb;
-int installing_snapshot = 0;		// defined whether or not an install snapshot is in progress, to avoid duplicate messages
+int installing_xapp_snapshot = 0;		// defined whether or not an install xapp snapshot is in progress, to avoid duplicate messages
+int installing_raft_snapshot = 0;		// defined whether or not an install xapp snapshot is in progress, to avoid duplicate messages
 
 
 /* ############ Implementation ############ */
@@ -158,6 +158,77 @@ void set_mrc( void *_mrc ) {
 }
 
 /*
+	Sets the maximum size (in bytes) of a given RFT message
+*/
+int set_max_msg_size( int size ) {
+	if( size < 512 ) {		// a minimum of sanity
+		logger_warn( "a minimum of 512 bytes of message size is required" );
+		return 0;
+	}
+	max_msg_size = size;
+	return 1;
+}
+
+/*
+	Returns the current term of the raft state
+
+	Assumes the caller has acquired the raft_state_lock
+*/
+term_t get_raft_current_term( ) {
+	return me.current_term;
+}
+
+/*
+	Sets the current term of the raft state
+
+	Assumes the caller has acquired the raft_state_lock
+*/
+void set_raft_current_term( term_t term ) {
+	me.current_term = term;
+}
+
+/*
+	Returns the last applied log index of the raft state
+
+	Assumes the caller has acquired the raft_state_lock
+*/
+index_t get_raft_last_applied( ) {
+	return me.last_applied;
+}
+
+/*
+	Sets the last applied log index of the raft state
+
+	Assumes the caller has acquired the raft_state_lock
+*/
+void set_raft_last_applied( index_t last_applied ) {
+	me.last_applied = last_applied;
+}
+
+/*
+	Sets the commit index of the raft state
+
+	Assumes the caller has acquired the raft_state_lock
+*/
+void set_raft_commit_index( index_t index ) {
+	me.commit_index = index;
+}
+
+/*
+	Acquires the mutex of the main raft state (i.e. me)
+*/
+void lock_raft_state( ) {
+	pthread_mutex_lock( &raft_state_lock );
+}
+
+/*
+	Releases the mutex of the main raft state (i.e. me)
+*/
+void unlock_raft_state( ) {
+	pthread_mutex_unlock( &raft_state_lock );
+}
+
+/*
 	Initializes the RFT library
 
 	_mrc: message router context (rmr)
@@ -169,6 +240,7 @@ void set_mrc( void *_mrc ) {
 void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb,
 					take_snapshot_cb_t take_snapshot_cb, install_snapshot_cb_t install_snapshot_cb ) {
 	server_id_t wbuf;
+	target_t target;
 	char *rft_id;			// used to change the server_id's name
 	char *envptr;			// general pointer to an environment variable value
 	char *bootstrap;		// holds the server_id that must initialize the raft configuration
@@ -200,11 +272,10 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		exit( 1 );
 	}
 
-	if( rmr_max_msg_size < 512 ) {		// a minimum of sanity
-		logger_fatal( "a minimum of 512 bytes for max_rmr_msg_size is required" );
+	if( !set_max_msg_size( rmr_max_msg_size ) ) {		// a minimum of sanity
+		logger_fatal( "unable to run RFT with the configured message size" );
 		exit( 1 );
 	}
-	max_msg_size = rmr_max_msg_size;
 
 	mrc = _mrc;
 
@@ -283,14 +354,16 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 			logger_info( "bootstrapping RFT cluster" );
 
 			snprintf( target_buf, sizeof(target_buf), "%s:%s", rft_id, listen_port );
-			if( ! raft_config_add_server( (server_id_t *) rft_id, target_buf, 0 ) ) {	// add itself to raft configuration servers
+			strncpy( target, target_buf, sizeof(target) - 1 );
+			target[sizeof(target) - 1] = '\0';	// ensuring the string is null-terminated
+			if( ! raft_config_add_server( (server_id_t *) rft_id, &target, 0 ) ) {	// add itself to raft configuration servers
 				logger_fatal( "unable to initialize RFT cluster configuration in rft_init" );
 				exit( 1 );
 			}
 
 			// add myself configuration in the very first append entries log and commit it (this is the only server in the cluster so far)
 			strcpy( cmd_data.server_id, rft_id );
-			strcpy( cmd_data.target, target_buf );
+			strcpy( cmd_data.target, target );
 			entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &cmd_data, sizeof(server_conf_cmd_data_t) );
 			if( entry == NULL ) {
 				logger_fatal( "unable to allocate log entry memory for bootstrapping RFT configuration" );
@@ -466,8 +539,8 @@ int rft_rts_msg( rmr_mbuf_t **msg, int mtype, int payload_size, server_id_t *ser
 	(*msg)->len = payload_size;
 	(*msg)->state = RMR_OK;
 
-	logger_trace( "%-*s type: %d, len: %3d, mrc: %p, msg: %p, server: %s",
-				LOGGER_PADDING, "replying message", mtype, payload_size, mrc, *(msg), server_id );
+	logger_trace( " replying  message type: %d, len: %3d, mrc: %p, msg: %p, server: %s",
+					mtype, payload_size, mrc, *(msg), server_id );
 
 	(*msg) = rmr_rts_msg( mrc, (*msg) );
 	while ((*msg) && (*msg)->state == RMR_ERR_RETRY && retries ) {
@@ -674,7 +747,7 @@ void become_candidate( rmr_mbuf_t **msg ) {
 
 	Assumes that raft_state_lock mutex is locked by the caller
 
-	NOTE: There is no one specific leader thread, it is implemented by threads that send appendEntries to their
+	NOTE: There is no one specific leader thread, it is implemented by raft_server threads that send Append Entries to their
 		  corresponding servers in the cluster.
 		  Those threads just send messages when its server's state is LEADER
 		  On converting to FOLLOWER those threads have to put themselves to sleep
@@ -692,6 +765,7 @@ void become_leader( ) {
 	logger_info( "becoming LEADER" );
 
 	me.state = LEADER;
+	strcpy( me.current_leader, me.self_id );
 
 	entry = new_raft_log_entry( me.current_term, RAFT_NOOP, 0, NULL, 0 );
 	if( entry == NULL ) {
@@ -704,7 +778,7 @@ void become_leader( ) {
 	raft_config_set_all_server_indexes( get_raft_last_log_index( ) );
 
 	/*
-		sending a signal to wakeup all append entries threads (now we are the leader)
+		sending a signal to wakeup all raft_server threads (now we are the leader)
 	*/
 	pthread_cond_broadcast( &leader_cond );
 }
@@ -744,17 +818,119 @@ term_match_e match_terms( term_t term ) {
 }
 
 /*
+	Sends Raft append entry messages to the raft cluster members
+
+	Note: acquires the raft_state_lock
+*/
+static inline void send_append_entries( rmr_mbuf_t **msg, rmr_whid_t whid, server_id_t *server_id,
+			index_t prev_log_index, unsigned int n_entries, unsigned char *srlz_buf, unsigned int bytes ) {
+	int mlen;	// the size of data in RMR payload, must be int and check for negative, in case of overflow (see rmr_mbuf_t len)
+	appnd_entr_hdr_t *payload;
+	log_entry_t *prev_log_entry;
+
+	assert( msg != NULL );
+	assert( server_id != NULL );
+	assert( srlz_buf != NULL );
+
+	mlen = (int) ( APND_ENTR_HDR_LEN + bytes );	// getting required size for the whole message
+	if( mlen < 0 ){
+		logger_fatal( "size overflow of serialized append entries" );
+		exit( 1 );
+	}
+
+	if( rmr_payload_size( *msg ) < mlen ) {
+		*msg = (rmr_mbuf_t *) rmr_realloc_payload( *msg, mlen, 0, 0 );
+		if( *msg == NULL ) {
+			logger_fatal( "unable to reallocate rmr_mbuf payload for the serialized append entries" );
+			exit( 1 );
+		}
+	}
+	payload = (appnd_entr_hdr_t *) (*msg)->payload;
+
+	prev_log_entry = get_raft_log_entry( prev_log_index );
+
+	if( prev_log_entry != NULL ) {
+		payload->prev_log_index = prev_log_entry->index;
+		payload->prev_log_term = prev_log_entry->term;
+	} else {
+		lock_raft_snapshot( );
+		payload->prev_log_index = get_raft_snapshot_last_index( );
+		payload->prev_log_term = get_raft_snapshot_last_term( );
+		unlock_raft_snapshot( );
+	}
+
+	payload->slen = bytes;			// setting serialized append entries payload size
+	payload->n_entries = n_entries;
+	if( n_entries )
+		memcpy( APND_ENTR_PAYLOAD_ADDR( (*msg)->payload ), srlz_buf, bytes );
+
+	pthread_mutex_lock( &raft_state_lock );
+
+	if( me.state == LEADER ) {		// if I'm still the leader then that message can be sent to the followers
+		payload->term = me.current_term;
+		strcpy( payload->leader_id, me.self_id );
+		payload->leader_commit = me.commit_index;
+
+		pthread_mutex_unlock( &raft_state_lock );	// releasing the lock before sending the message
+
+		logger_trace( " sending   append entries request to %s, term: %lu, n_entries: %u, prev_log_index: %lu, prev_log_term: %lu, leader_commit: %lu",
+					server_id, payload->term, payload->n_entries, payload->prev_log_index,
+					payload->prev_log_term, payload->leader_commit );
+
+		rft_send_wh_msg( msg, whid, APPEND_ENTRIES_REQ, mlen, server_id );
+
+	} else {
+		pthread_mutex_unlock( &raft_state_lock );
+	}
+}
+
+/*
+	Sends Raft snapshot messages to the raft cluster members
+
+	Note: acquires the raft_state_lock
+*/
+void send_raft_snapshot( rmr_mbuf_t **msg, rmr_whid_t whid, server_id_t *server_id ) {
+	int plen;		// the size of data in RMR payload
+	raft_snapshot_hdr_t *payload;
+
+	assert( msg != NULL );
+	assert( server_id != NULL );
+
+	plen = serialize_raft_snapshot( msg );
+	if( plen ) {
+
+		pthread_mutex_lock( &raft_state_lock );
+
+		if( me.state == LEADER ) {	// might be set to NULL by exit tasks of the raft_server thread
+			payload = (raft_snapshot_hdr_t *) (*msg)->payload;
+			payload->term = HTONLL( me.current_term );
+			strcpy( payload->leader_id, me.current_leader );
+
+			pthread_mutex_unlock( &raft_state_lock );	// releasing the lock before sending the message
+
+			logger_warn( "sending raft snapshot to %s, bytes: %lu", server_id, plen );
+
+			rft_send_wh_msg( msg, whid, RAFT_SNAPSHOT_REQ, plen, server_id );
+
+		} else {
+			pthread_mutex_unlock( &raft_state_lock );
+		}
+
+	} else {
+		logger_warn( "no raft config snapshot has been taken yet" );
+	}
+}
+
+/*
 	Implements a thread for each raft server in the configuration
 
-	Acquires raft_state_lock
+	Acquires raft_state_lock (local and inline), and server index_lock
 */
-void *send_append_entries( void *raft_server ) {
+void *raft_server( void *new_server ) {
 	unsigned int i;	// general counter used to iterate over the replica_servers array
-	int count = 10;	// counter for rmr_wh_open retries
-	int mlen;		// the size of data in RMR payload, must be int and check for negative, in case of overflow (see rmr_mbuf_t len)
+	int count;	// counter for rmr_wh_open retries
 	rmr_whid_t whid = -1;
 	rmr_mbuf_t *msg = NULL;
-	appnd_entr_hdr_t *payload = NULL;
 	struct timespec next_heartbeat = {0, 0};	// defines the timeout to trigger the next heartbeat for this thread
 	pthread_mutex_t heartbeat_lock = PTHREAD_MUTEX_INITIALIZER;
 	pthread_cond_t heartbeat_cond = PTHREAD_COND_INITIALIZER;
@@ -762,7 +938,7 @@ void *send_append_entries( void *raft_server ) {
 	unsigned int buf_len;				// size of the serialization buffer
 	unsigned int bytes;					// number of bytes serialized in the message
 	unsigned int n_entries;				// number of log entries transmitted in the message
-	log_entry_t *prev_log_entry = NULL;
+	index_t prev_log_index;
 	index_t last_log_index;
 	int rounds = 10;		// run catch-up for a fixed number of rounds, fig 4.1 in raft dissertation
 	int progress = 0;		// identifies if a catching-up server made a progress within a heartbeat
@@ -773,8 +949,8 @@ void *send_append_entries( void *raft_server ) {
 		.target = {'\0'}
 	};
 
-	assert( raft_server != NULL);
-	server_t *server = (server_t *) raft_server;
+	assert( new_server != NULL);
+	server_t *server = (server_t *) new_server;
 
 	server->heartbeat_cond = &heartbeat_cond;	// this thread needs to be awaked upon receiving an append reply with success = 0
 	server->leader_cond = &leader_cond;	// this thread needs to be awaked if not in leader state (upon deleting this server from cluster)
@@ -782,40 +958,72 @@ void *send_append_entries( void *raft_server ) {
 
 	server->active = RUNNING;	// needs come after pthread conditions
 
-	msg = rmr_alloc_msg( mrc, sizeof( request_append_entries_t ) );
+	msg = rmr_alloc_msg( mrc, 4096 );	// used by append entries and snapshotting (initial size)
 	if( msg == NULL ) {
-		logger_error( "unable to allocate rmr_mbuf to send append entries for server %s", server->server_id );
+		logger_fatal( "unable to allocate rmr_mbuf for raft replication on server %s", server->server_id );
+		exit( 1 );
 	}
 
-	buf_len = 512;
+	buf_len = 4096;
 	srlz_buf = (unsigned char *) malloc( buf_len );	// minimum buffer size, it can be reallocated by the serializer function
 	if( srlz_buf == NULL ) {
-		logger_error( "unable to allocate a buffer to serialize append entries for server %s", server->server_id );
+		logger_fatal( "unable to allocate a buffer to serialize append entries on server %s", server->server_id );
+		exit( 1 );
 	}
 
-	while ( count > 0 )	{
-		whid = rmr_wh_open( mrc, server->target );
-		if( whid < 0 ) {
-			logger_error( "unable to connect to %s", server->target );
-			usleep( 1 + rand() % 50 );	// wait random time from 1us to 50us before retrying
-			count--;
-			continue;
+	while( ( server->active == RUNNING ) && ( !RMR_WH_CONNECTED( whid ) ) ) {
+		for( count = 10; count && server->active == RUNNING; count-- )	{
+			whid = rmr_wh_open( mrc, server->target );
+			if( RMR_WH_CONNECTED( whid ) ) {
+				logger_trace( "connected to %s by wormhole id %d", server->target, whid );
+				break;
+			} else {
+				logger_error( "unable to connect to %s", server->target );
+				usleep( 300000 + (rand() % 200001) );	// wait a random time between 300ms and 500ms before retrying
+			}
 		}
-		break;
-	}
-	if( whid < 0 ) {
-		logger_error( "unable to connect to %s\tgiving up!", server->target );
-	} else {
-		logger_trace( "connected to %s by wormhole id %d", server->target, whid );
+		if( count ) {
+			break;
+		} else {
+			pthread_mutex_lock( &raft_state_lock );
+			if( me.state == LEADER ) {	// giving up if unable to connect
+				// Only the leader can ask to a server to be removed from the cluster
+				logger_error( "unable to connect to %s\tgiving up!", server->target );
+				// appending server delete to the log
+				strcpy( data.server_id, server->server_id );
+				strcpy( data.target, server->target );
+				new_entry = new_raft_log_entry( me.current_term, RAFT_CONFIG, DEL_MEMBER, &data, sizeof(server_conf_cmd_data_t) );
+				if( new_entry == NULL ) {
+					logger_fatal( "unable to allocate memory for a delete server configuration log entry" );
+					exit( 1 );
+				}
+				pthread_mutex_unlock( &raft_state_lock );
+
+				append_raft_log_entry( new_entry );
+
+			} else {
+				/*
+					A follower cannot remove a server from the cluster due to wormhole connection issues
+					A follower also cannot just exit the application due to cluster availability
+					Thus, we put this non-leader thread to sleep and wait it to be awaked to retry
+				*/
+				pthread_mutex_unlock( &raft_state_lock );
+
+				// putting this thread to sleep, waiting for a BROADCAST signal from become_leader or from remove_server
+				if( server->active ) {	// this server could be removed and so it does not need to wait for a signal to wake-up and finish
+					pthread_mutex_lock( &leader_lock );
+					logger_trace( "raft server %s is going to sleep", server->server_id );
+					pthread_cond_wait( &leader_cond, &leader_lock );
+					logger_trace( "raft server %s was awaked", server->server_id );
+					pthread_mutex_unlock( &leader_lock );
+				}
+			}
+		}
 	}
 
-	if( ( msg == NULL ) || ( srlz_buf == NULL ) || whid < 0 ) {
-		raft_config_remove_server( &server->server_id );
-	} else {
-		// TODO Send config snapshot here if "me" is the LEADER....
-	}
-
+#if !defined(INSIDE_UNITTEST)
 	while ( server->active ) {
+#endif
 		/*
 			Only used to put this thread to sleep (cond_wait)
 			However, we can save some important CPU cycles and ns by avoiding doing extra lock/unlock in each loop
@@ -824,11 +1032,17 @@ void *send_append_entries( void *raft_server ) {
 
 		/*
 			this server will check again if it is still the leader before send a message
-			so, we don't to lock server_state here, no harmful code will be executed
+			so, we don't lock raft_state here, no harmful code will be executed
 		*/
+	#if !defined(INSIDE_UNITTEST)
 		while( me.state == LEADER && server->active == RUNNING ) {
+	#endif
+			n_entries = 0;
+			bytes = 0;
 
 			pthread_mutex_lock( &server->index_lock ); // required to avoid modification on match_index, next_index
+			prev_log_index = server->next_index - 1;
+
 			/*
 				Until the leader has discovered the point where its and the follower’s logs match, the leader can send
 				AppendEntries with no entries (like heartbeats) to save bandwidth. Then, once the matchIndex
@@ -838,66 +1052,26 @@ void *send_append_entries( void *raft_server ) {
 			logs_match = ( server->match_index == server->next_index - 1 );
 			if( logs_match ) {
 				last_log_index = get_raft_last_log_index( );
-				n_entries = (unsigned int) last_log_index - ( server->next_index - 1 );
+				errno = 0;
+				n_entries = (unsigned int) last_log_index - prev_log_index;
+				if( n_entries )
+					bytes = serialize_raft_log_entries( server->next_index, &n_entries, &srlz_buf, &buf_len, max_msg_size );
 			} else {
-				n_entries = 0;
+				errno = 0;
 			}
-
-			if( n_entries ) {
-				bytes = serialize_raft_log_entries( server->next_index, &n_entries, &srlz_buf, &buf_len, max_msg_size );
-			} else {
-				bytes = 0;
-			}
-
-			prev_log_entry = get_raft_log_entry( server->next_index - 1 );
 
 			pthread_mutex_unlock( &server->index_lock );
 
-			mlen = (int) ( sizeof( appnd_entr_hdr_t ) + bytes );	// getting required size for the whole message
-			if( mlen < 0 ){
-				logger_fatal( "size overflow of serialized append entries" );
-				exit( 1 );
-			}
+			if( errno != ENODATA ) {	// serialize_raft_log_entries sets errno if it is required to send a snapshot
+				send_append_entries( &msg, whid, &server->server_id, prev_log_index, n_entries, srlz_buf, bytes );
 
-			if( rmr_payload_size( msg ) < mlen ) {
-				msg = (rmr_mbuf_t *) rmr_realloc_payload( msg, mlen, 0, 0 );
-				if( msg == NULL ) {
-					logger_fatal( "unable to reallocate rmr_mbuf payload for the serialized append entries" );
-					exit( 1 );
-				}
-			}
-			payload = (appnd_entr_hdr_t *) msg->payload;
-
-			if( prev_log_entry != NULL ) {
-				payload->prev_log_index = prev_log_entry->index;
-				payload->prev_log_term = prev_log_entry->term;
 			} else {
-				payload->prev_log_index = 0;
-				payload->prev_log_term = 0;
+				send_raft_snapshot( &msg, whid, &server->server_id );
 			}
 
-			payload->slen = bytes;			// setting serialized append entries payload size
-			payload->n_entries = n_entries;
-			if( n_entries )
-				memcpy( APND_ENTR_PAYLOAD_ADDR( msg->payload ), srlz_buf, bytes );
-
-			pthread_mutex_lock( &raft_state_lock );
-
-			if( me.state == LEADER ) {		// if I'm still the leader then that message can be sent to the followers
-				payload->term = me.current_term;
-				strcpy( payload->leader_id, me.self_id );
-				payload->leader_commit = me.commit_index;
-
-				logger_trace( " sending	append entries request to %s, term: %lu, n_entries: %u, prev_log_index: %lu, prev_log_term: %lu, leader_commit: %lu",
-							server->server_id, payload->term, payload->n_entries, payload->prev_log_index,
-							payload->prev_log_term, payload->leader_commit );
-
-				rft_send_wh_msg( &msg, whid, APPEND_ENTRIES_REQ, mlen, &server->server_id );
-			}
-
-			pthread_mutex_unlock( &raft_state_lock );
-
-			pthread_cond_timedwait( &heartbeat_cond, &heartbeat_lock, &next_heartbeat ); // can be awaked upon append entries reply
+			timespec_get( &next_heartbeat, TIME_UTC );
+			timespec_add_ms( next_heartbeat, HEARTBEAT_TIMETOUT );	// setting the next heartbeat timeout
+			pthread_cond_timedwait( &heartbeat_cond, &heartbeat_lock, &next_heartbeat );
 
 			/* catching-up routine for new servers */
 			if( ( server->status == NON_VOTING_MEMBER ) && logs_match ) {
@@ -939,9 +1113,9 @@ void *send_append_entries( void *raft_server ) {
 			}
 			pthread_mutex_unlock( &raft_state_lock );
 
-			timespec_get( &next_heartbeat, TIME_UTC );
-			timespec_add_ms( next_heartbeat, HEARTBEAT_TIMETOUT );	// setting the next heartbeat timeout
+	#if !defined(INSIDE_UNITTEST)
 		}
+	#endif
 
 		pthread_mutex_unlock( &heartbeat_lock );
 
@@ -953,13 +1127,15 @@ void *send_append_entries( void *raft_server ) {
 				it may not be awaked if lock is get just after a broadcast signal,
 				no crash will happen, just the target server will timeout and become candidate
 			*/
-			logger_trace( "server %s is going to sleep: append_entries", server->server_id );
+			logger_trace( "raft server %s is going to sleep", server->server_id );
 			pthread_cond_wait( &leader_cond, &leader_lock );
-			logger_trace( "server %s awaked: append_entries", server->server_id );
+			logger_trace( "raft server %s was awaked", server->server_id );
 			pthread_mutex_unlock( &leader_lock );
 		}
 
+#if !defined(INSIDE_UNITTEST)
 	}
+#endif
 
 	// clean up routines
 	logger_debug( "running thread clean up of server %s", server->server_id );
@@ -991,7 +1167,9 @@ void *send_append_entries( void *raft_server ) {
 	pthread_mutex_unlock( &replica_lock );
 
 	logger_trace( "freeing server %s", server->server_id );
+#if !defined(INSIDE_UNITTEST)
 	free( server );
+#endif
 
 	return NULL;
 }
@@ -1012,8 +1190,6 @@ void *state_replication( ) {
 	struct timespec timeout;
 	unsigned int rep_i;					// counter to iterate over replica_servers' array
 	int must_lock;						// controls if it is required to get the replica_lock before going to sleep
-	snapshot_t *snapshot;				// points to the last snapshot
-	req_snapshot_hdr_t *snapshot_msg = NULL;
 
 	msg = rmr_alloc_msg( mrc, RMR_MAX_RCV_BYTES );
 	if( msg == NULL ) {
@@ -1044,7 +1220,7 @@ void *state_replication( ) {
 
 		for( rep_i = 0; rep_i < replica_servers.len; rep_i++ ) {	// needs to own the replica_lock here
 			replica = replica_servers.servers[rep_i];
-			if( replica == NULL )	// replica_server[i] was set to NULL on send_append_entries exiting
+			if( replica == NULL )	// replica_server[i] was set to NULL on raft_server thread exiting
 				continue;
 
 			master_index = replica->master_index;	// we already have the lock here
@@ -1061,7 +1237,7 @@ void *state_replication( ) {
 				if( bytes ) {
 					mlen = (int) ( sizeof( repl_req_hdr_t ) + bytes );	// getting required size for the whole message
 					if( mlen < 0 ){
-						logger_fatal( "size overflow of serialized append entries" );
+						logger_fatal( "size overflow of serialized server log entries" );
 						exit( 1 );
 					}
 
@@ -1075,48 +1251,28 @@ void *state_replication( ) {
 					request = (repl_req_hdr_t *) msg->payload;
 					request->master_index = master_index;
 					strcpy( request->server_id, me.self_id );
-					request->slen = bytes;			// setting serialized append entries payload size
+					request->slen = bytes;			// setting serialized log entries payload size
 					request->n_entries = n_entries;
 					memcpy( REPL_REQ_PAYLOAD_ADDR( msg->payload ), srlz_buf, bytes );
 
 					pthread_mutex_lock( &replica_lock );
 					must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
-					if( replica ) {
+					if( replica_servers.servers[rep_i] ) {	// might be set to NULL on raft_server thread exiting
 						logger_debug( "sending   replication request to %s, n_entries: %u, bytes: %u, master_index: %lu",
 									replica->server_id, request->n_entries, bytes, request->master_index );
 
 						rft_send_wh_msg( &msg, *replica->whid, REPLICATION_REQ, mlen, &replica->server_id );
 					}
 				} else if( errno == ENODATA ) {	// ENODATA means that no log entry was found, thus requires to SEND a SNAPSHOT
-					snapshot = get_xapp_snapshot( );
-					if( snapshot ) {
-						mlen = (int) ( SNAPSHOT_REQ_HDR_SIZE + snapshot->dlen );	// getting required size for the whole message
-						if( mlen < 0 ){
-							logger_fatal( "size overflow of serialized snapshot" );
-							exit( 1 );
-						}
-						if( rmr_payload_size( msg ) < mlen ) {
-							msg = (rmr_mbuf_t *) rmr_realloc_payload( msg, mlen, 0, 0 );
-							if( msg == NULL ) {
-								logger_fatal( "unable to reallocate rmr_mbuf payload to send a server snapshot" );
-								exit( 1 );
-							}
-						}
-						snapshot_msg = (req_snapshot_hdr_t *) msg->payload;
-						snapshot_msg->type = htonl( SERVER_SNAPSHOT );
-						snapshot_msg->last_log_index = HTONLL( snapshot->last_log_index );
-						snapshot_msg->dlen = HTONLL( snapshot->dlen );
-						snapshot_msg->items = htonl( snapshot->items );
-						strcpy( snapshot_msg->server_id, me.self_id );
-						memcpy( SNAPSHOT_REQ_PAYLOAD_ADDR( msg->payload ), snapshot->data, snapshot->dlen );
+					mlen = serialize_xapp_snapshot( &msg, &me.self_id );
+					if( mlen ) {
 
 						pthread_mutex_lock( &replica_lock );
 						must_lock = 0;	// means that there is no need to get the replica_lock again, leading to deadlocks
-						if( replica ) {
-							logger_warn( "sending snapshot request to %s, type: %d, items: %u, bytes: %lu, master_index: %lu",
-										replica->server_id, SERVER_SNAPSHOT, snapshot->items, snapshot->dlen, snapshot->last_log_index );
+						if( replica_servers.servers[rep_i] ) {	// might be set to NULL on raft_server thread exiting
+							logger_warn( "sending xapp snapshot to %s, bytes: %lu", replica->server_id, mlen );
 
-							rft_send_wh_msg( &msg, *replica->whid, SNAPSHOT_REQ, mlen, &replica->server_id );
+							rft_send_wh_msg( &msg, *replica->whid, XAPP_SNAPSHOT_REQ, mlen, &replica->server_id );
 						}
 					} else {
 						logger_warn( "no xapp snapshot has been taken yet" );
@@ -1236,7 +1392,7 @@ void handle_vote_reply( reply_vote_t *reply_vote_msg ) {
 
 	A new thread is started to send AppendEntries to that server
 */
-void handle_membership_request( membership_request_t *membership_msg, char *src_addr ) {
+void handle_membership_request( membership_request_t *membership_msg, target_t *src_addr ) {
 
 	pthread_mutex_lock( &raft_state_lock );
 
@@ -1256,11 +1412,27 @@ void handle_membership_request( membership_request_t *membership_msg, char *src_
 }
 
 /*
-	Applies new commited entries sequentialy up to the me.commit_index (including it)
+	Updates the list of xApp replica servers
 
 	Not thread-safe, assumes that the caller has the lock of raft_state_lock
 */
-static inline void raft_apply_log_entries( ) {
+void update_replica_servers( ) {
+	if( me.state != INIT_SERVER ) {
+		pthread_mutex_lock( &replica_lock );
+
+		get_replica_servers( &me.self_id, &replica_servers, repl_type == PARTIAL ? num_replicas : raft_get_num_servers( ) - 1 ); // me is not included
+		pthread_cond_signal( &replica_cond );
+
+		pthread_mutex_unlock( &replica_lock );
+	}
+}
+
+/*
+	Applies new committed entries sequentialy up to the me.commit_index (including it)
+
+	Not thread-safe, assumes that the caller has the lock of raft_state_lock
+*/
+void raft_apply_log_entries( ) {
 	log_entry_t *entry;
 	server_conf_cmd_data_t *data;
 	server_t *server = NULL;
@@ -1299,7 +1471,8 @@ static inline void raft_apply_log_entries( ) {
 			}
 
 		} else if( entry->type == RAFT_NOOP ) {
-			logger_debug( "Applied RAFT_NOOP log entry, term: %lu, index: %lu", entry->term, entry->index );
+			if( me.state == LEADER )
+				logger_debug( "applied RAFT_NOOP log entry, term: %lu, index: %lu", entry->term, entry->index );
 			// nothing else to do here
 
 		} else {	// the other entry type is RAFT_COMMAND
@@ -1313,14 +1486,8 @@ static inline void raft_apply_log_entries( ) {
 		me.last_applied++;
 	}
 
-	if( cfg_change && me.state != INIT_SERVER ) {
-		pthread_mutex_lock( &replica_lock );
-
-		get_replica_servers( &me.self_id, &replica_servers, repl_type == PARTIAL ? num_replicas : raft_get_num_servers( ) - 1 ); // me is not included
-		pthread_cond_signal( &replica_cond );
-
-		pthread_mutex_unlock( &replica_lock );
-	}
+	if( cfg_change )
+		update_replica_servers( );
 }
 
 /*
@@ -1340,88 +1507,90 @@ static inline void raft_apply_log_entries( ) {
 		LEADER: has to pass the expected next log index to be commited
 		OTHERS: have to pass the leader_commit received in append entries request
 */
-static inline void raft_commit_log_entries( index_t new_commit_index ) {
+void raft_commit_log_entries( index_t new_commit_index ) {
 	log_entry_t *entry;
-	index_t last_log_index;
 	index_t cindex;		// used to check if the commit entry is a cluster configuration
 
-	/*
-		New commit index needs to be less|equal than raft last log index to commit a log entry
-		This can happen when a server restarts before the leader was able to remove that server from the configuration
-		The new commit index will be greater that the raft last log index, as the later will be 0 (zero) after server restarts (in memory FSM)
-	*/
-	if( new_commit_index <= get_raft_last_log_index( ) ) {
-		logger_debug( "committing raft log entries" );
+	logger_debug( "committing raft log entries, trying to commit index: %lu", new_commit_index );
 
-		if( me.state == LEADER ) {
-			/*
-				iterating back up to find the safe new commit_index
-				the new_commit_index not necessary is replicated on the majority of servers, but a previous one can be
-			*/
-			while( new_commit_index > me.commit_index) {	// there exists an N such that N > commitIndex
-				entry = get_raft_log_entry( new_commit_index );
-				if( entry == NULL )
-					return;
-
-				/*
-					Raft never commits log entries from previous terms by counting replicas.
-					Only log entries from the leader’s current term are committed by counting replicas.
-					Section 5.4.2 and Fig. 8 from raft paper
-
-					Once an entry from the current term has been committed in this way, then all prior
-					entries are committed indirectly because of the Log Matching Property.
-					Section 3.6.2 in raft dissertation
-				*/
-				if( entry->term != me.current_term )	// ...and log[N].term == currentTerm
-					return;
-
-				if( has_majority_of_match_index( new_commit_index ) )	// a majority of matchIndex[i] >= N
-					break;	// we found the most up-to-date log replicated on the majority of servers
-
-				new_commit_index--;	//using the same variable to iterate back
+	if( me.state == LEADER ) {
+		/*
+			iterating back up to find the safe new commit_index
+			the new_commit_index not necessary is replicated on the majority of servers, but a previous one can be
+		*/
+		while( new_commit_index > me.commit_index) {	// there exists an N such that N > commitIndex
+			entry = get_raft_log_entry( new_commit_index );
+			if( entry == NULL ) {
+				logger_warn( "the leader does not have a log entry with index %ld to commit" );
+				return;
 			}
 
-			// searching for a configuration entry, since we need to release the configuration changing flag
-			cindex = me.commit_index + 1;
-			while( cindex <= new_commit_index ) {
-				entry = get_raft_log_entry( cindex );
-				if( entry == NULL ) {
-					logger_error( "unable to find log entry by index %ld", cindex );
-					return;
-				}
-				if( entry->type == RAFT_CONFIG ) {
-					set_configuration_changing( 0 );	// finishing the cluster (re)configuration
-					break;	// we found the only one allowed configuration to be committed at a time
-				}
-				cindex++;
-			}
-		}
-
-		// this will work to commit entries by the servers is all statuses, including the leader
-		if( new_commit_index > me.commit_index	) {	// need to ensure that N > commitIndex
 			/*
-				Receiver implementation fig. 2 raft paper
-				If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last** new entry)
-				** leader commit can be greater than our last log index
-				here leaderCommit is the new_commit_index
+				Raft never commits log entries from previous terms by counting replicas.
+				Only log entries from the leader’s current term are committed by counting replicas.
+				Section 5.4.2 and Fig. 8 from raft paper
+
+				Once an entry from the current term has been committed in this way, then all prior
+				entries are committed indirectly because of the Log Matching Property.
+				Section 3.6.2 in raft dissertation
 			*/
-			last_log_index = get_raft_last_log_index( );	// at this point all new log in append entries were added to the log
+			if( entry->term != me.current_term )	// ...and log[N].term == currentTerm
+				return;
 
-			// min(leaderCommit, index of last new entry)
-			me.commit_index = MIN( new_commit_index, last_log_index );
+			if( has_majority_of_match_index( new_commit_index ) )	// a majority of matchIndex[i] >= N
+				break;	// we found the most up-to-date log replicated on the majority of servers
 
-			// persist_logs( &me, me.commit_index );	// saving logs on stable storage (not needed we are using in-memory FSM)
-
-			raft_apply_log_entries( );
+			new_commit_index--;	// using the same variable to iterate back
 		}
+
+		// searching for a configuration entry, since we need to release the configuration changing flag
+		cindex = me.commit_index + 1;
+		while( cindex <= new_commit_index ) {
+			entry = get_raft_log_entry( cindex );
+			if( entry == NULL ) {
+				logger_error( "unable to find log entry by index %ld", cindex );
+				return;
+			}
+			if( entry->type == RAFT_CONFIG ) {
+				set_configuration_changing( 0 );	// finishing the cluster (re)configuration
+				break;	// we found the only one allowed configuration to be committed at a time
+			}
+			cindex++;
+		}
+
+	} else {	// followers and candidates
+		/*
+			New commit index needs to be smaller|equal than raft last log index to commit a log entry
+			This can happen at least in two situations:
+			1.	The leader could have chopped the number of serialized log entries (see RMR max_msg_size)
+				before send the append entries message, even though it has already commited further entries
+
+			2.	When a server restarts before the leader was able to remove that server from the configuration
+				The new commit index will be greater than the raft last log index, as the later will be 0 (zero)
+				after a server restarts (we use in memory FSM)
+
+			Receiver implementation fig. 2 raft paper
+			If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+			here leaderCommit is the new_commit_index
+			Thus, min(new_commit_index, last_log_index)
+		*/
+		new_commit_index = MIN( new_commit_index, get_raft_last_log_index( ) ); // at this point all new log entries were added to the log
+	}
+
+	// this will work to commit entries by the servers is all statuses, including the leader
+	if( new_commit_index > me.commit_index	) {	// need to ensure that N > commitIndex
+
+		me.commit_index = new_commit_index;
+
+		// persist_logs( &me, me.commit_index );	// saving logs on stable storage (not needed we are using in-memory FSM)
+
+		raft_apply_log_entries( );
 	}
 }
 
 void handle_append_entries_request( request_append_entries_t *request_msg, reply_append_entries_t *response_msg) {
 	int match;
-	int no_conflict = 1;	// identifies if append entries conflicted with the commited log, mainly because of duplicate messages
 	unsigned int i;
-	log_entry_t *log_entry = NULL;
 
 	assert( request_msg != NULL );
 	assert( response_msg != NULL );
@@ -1440,61 +1609,31 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 
 	} else {
 
-		if( strlen( me.current_leader ) == 0 ) {	// if term changed it was cleaned by on matching terms
+		if( *me.current_leader == '\0' ) {	// if term has changed it was cleaned by match_terms
 			strcpy( me.current_leader, request_msg->leader_id );	// setting the current leader we believe is for current term
 		}
 
-		/*
-			call get_raft_log_entry from log module
-			compare if the request_msg prev_log_term (and prev_log_index) is equal to the retrieved log entry
-			if do not, return success = 0
-			See section 5.3 in raft paper
-			prev_log_index can be different of 0 at first log, (e.g. starting log from a leader snapshot)
-			IMPORTANT: Need to release log inconsistencies starting from prev_log_index + 1
-		*/
-		log_entry = get_raft_log_entry( request_msg->prev_log_index );
+		if( check_raft_log_consistency( request_msg->prev_log_index, request_msg->prev_log_term, me.commit_index ) ) {
+			if( request_msg->n_entries ) {	// if no n_entries, this message is a hertbeat
+				logger_debug( "appending %u new log entries", request_msg->n_entries );
 
-		if( get_raft_last_log_index( ) > request_msg->prev_log_index ) {	// checking for log inconsistencies
-			no_conflict = remove_raft_conflicting_entries( request_msg->prev_log_index + 1, me.commit_index );
-		}
-
-		// last_log_index equals 0 means that the log is empty
-		if( ( log_entry && ( log_entry->term == request_msg->prev_log_term ) && (log_entry->index == request_msg->prev_log_index) ) ||
-			( get_raft_last_log_index( ) == 0 ) ) {
-
-			if( no_conflict ) {
-				if( request_msg->n_entries ) {	// if no n_entries, this message is a hertbeat
-					logger_debug( "appending %u new log entries", request_msg->n_entries );
-
-					for( i = 0; i < request_msg->n_entries; i++ ) {		// adding all new log entries to the log
-						append_raft_log_entry( request_msg->entries[i] );
-					}
+				for( i = 0; i < request_msg->n_entries; i++ ) {		// adding all new log entries to the log
+					append_raft_log_entry( request_msg->entries[i] );
 				}
+			}
 
-				/*
-					we need to guarantee that leader_commit is not greater than prev_log_index
-					this is required because the leader could have chopped the number of serialized log entries (see RMR max_msg_size),
-					even though it has already commited further entries
-					implementing this here simplifies the code, rather than in the raft send append entries thread
-				*/
-				request_msg->leader_commit = MIN( request_msg->leader_commit, request_msg->prev_log_index );
-
-				if( me.commit_index < request_msg->leader_commit ) {
-					// do not need to call raft commit log entries for every append entries msg
-					raft_commit_log_entries( request_msg->leader_commit );
-				}
-			}	// if there is a conflict, we simply ignore that append entries message, sec 3.7 in raft dissertation
+			if( me.commit_index < request_msg->leader_commit ) {
+				// do not need to call raft commit log entries for every append entries msg
+				raft_commit_log_entries( request_msg->leader_commit );
+			}
 
 			response_msg->success = 1;
 
-		} else {
+		} else {	// if there is a conflict, we simply ignore that append entries message, sec 3.7 in raft dissertation
 
 			response_msg->success = 0;
 
 		}
-
-		// by replying the last_log_index the leader can cap the next index correctly and quickly (and simplifies the code)
-		response_msg->last_log_index = get_raft_last_log_index( );
 
 		pthread_mutex_lock( &election_timeout_lock );
 		timespec_get( &election_timeout, TIME_UTC );
@@ -1504,6 +1643,9 @@ void handle_append_entries_request( request_append_entries_t *request_msg, reply
 	}
 
 	pthread_mutex_unlock( &raft_state_lock );
+
+	// by replying the last_log_index the leader can cap the next index correctly and quickly (and simplifies the code)
+	response_msg->last_log_index = get_raft_last_log_index( );
 }
 
 void handle_append_entries_reply( reply_append_entries_t *reply_msg ) {
@@ -1522,9 +1664,9 @@ void handle_append_entries_reply( reply_append_entries_t *reply_msg ) {
 			/*
 				if server is NON_VOTING_MEMBER and replies two subsequent rounds within the heartbeat timeout,
 				we assume its log is up-to-date
-				this check is called by the send append entries thread
+				this check is called by the raft_server thread
 			*/
-			timespec_get( &server->replied_ts, TIME_UTC ); // currently used only to check of non_voting_member is caught-up
+			timespec_get( &server->replied_ts, TIME_UTC ); // currently used only to check if non_voting_member is caught-up
 
 			pthread_mutex_lock( &server->index_lock );	// lock required to modify match_index, and commit_index
 
@@ -1532,22 +1674,21 @@ void handle_append_entries_reply( reply_append_entries_t *reply_msg ) {
 				If successful: update nextIndex and matchIndex for follower (§5.3 raft paper)
 				If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3 raft paper)
 
-				Changed: now the request append entries message is returning last_log_index,
-				so we can get this information from there all the times
-				This allows to cap the correct next index accordingly more quickly withou back-and-forth
+				Changed: now the reply append entries message is returning the follower's last_log_index
+				This allows to cap the correct next index accordingly more quickly without back-and-forth
 				of heartbeats
 			*/
-			server->match_index = reply_msg->last_log_index;
 			server->next_index = reply_msg->last_log_index + 1;
 
 			if( reply_msg->success ) {
+				server->match_index = reply_msg->last_log_index;
 
 				if( server->match_index > me.commit_index	) {	// ensuring that N > commitIndex
 					raft_commit_log_entries( server->match_index );
 				}
 			}
 
-			server->hb_timeouts = 0;	// will be incremented by the send append entries thread
+			server->hb_timeouts = 0;	// will be incremented by the raft_server thread
 
 			pthread_mutex_unlock( &server->index_lock );
 		}
@@ -1612,62 +1753,53 @@ void handle_replication_reply( replication_reply_t *reply ) {
 		server->master_index = reply->replica_index;	// master_index receives the confirmation of replicas' replica_index
 }
 
-void handle_snapshot_request( snapshot_request_t *request, snapshot_reply_t *reply ) {
+void handle_xapp_snapshot_request( xapp_snapshot_request_t *request, xapp_snapshot_reply_t *reply ) {
 	server_t *server = NULL;
 
 	assert( request != NULL );
 	assert( reply != NULL );
 
-	reply->type = request->type;
 	strcpy( reply->server_id, me.self_id );
 
 	server = raft_config_get_server( &request->server_id );
 
 	if( server ) {
-		if( request->type == SERVER_SNAPSHOT ) {
-			if( install_xapp_snapshot_cb != NULL ) {
 
-				pthread_mutex_lock( &installing_snapshot_lock );
-				if( !installing_snapshot ) {
-					installing_snapshot = 1;
-					pthread_mutex_unlock( &installing_snapshot_lock );
+		if( install_xapp_snapshot_cb != NULL ) {
 
-					install_xapp_snapshot_cb( request->snapshot.items, request->snapshot.data );
-					server->replica_index = request->snapshot.last_log_index;
-					reply->success = 1;
+			pthread_mutex_lock( &installing_xapp_snapshot_lock );
+			if( !installing_xapp_snapshot ) {
+				installing_xapp_snapshot = 1;
+				pthread_mutex_unlock( &installing_xapp_snapshot_lock );
 
-					pthread_mutex_lock( &installing_snapshot_lock );
-					installing_snapshot = 0;
-					pthread_mutex_unlock( &installing_snapshot_lock );
-				} else {
-					pthread_mutex_unlock( &installing_snapshot_lock );
+				install_xapp_snapshot_cb( request->snapshot.items, request->snapshot.data );
+				server->replica_index = request->snapshot.last_index;
+				reply->success = 1;
 
-					reply->success = 0;
-				}
-
+				pthread_mutex_lock( &installing_xapp_snapshot_lock );
+				installing_xapp_snapshot = 0;
+				pthread_mutex_unlock( &installing_xapp_snapshot_lock );
 			} else {
-				logger_warn( "there is no registered install snapshot callback" );
+				pthread_mutex_unlock( &installing_xapp_snapshot_lock );
+
 				reply->success = 0;
 			}
 
-		} else if( request->type == RAFT_SNAPSHOT ) {
-			logger_fatal( "raft snapshot is not implemented yet" );
-			exit( 1 );
 		} else {
-			logger_warn( "unknown snapshot message type: %d", request->type );
+			logger_warn( "there is no registered install snapshot callback" );
 			reply->success = 0;
 		}
 
-		reply->last_log_index = server->replica_index;
+		reply->last_index = server->replica_index;
 
 	} else {
-		logger_debug( "unable to find raft config server %s", request->server_id );
-		reply->last_log_index = 0;
+		logger_warn( "unable to find raft config server %s", request->server_id );
+		reply->last_index = 0;
 		reply->success = 0;
 	}
 }
 
-void handle_snapshot_reply( snapshot_reply_t *reply ) {
+void handle_xapp_snapshot_reply( xapp_snapshot_reply_t *reply ) {
 	server_t *server = NULL;
 
 	assert( reply != NULL );
@@ -1675,20 +1807,63 @@ void handle_snapshot_reply( snapshot_reply_t *reply ) {
 	server = raft_config_get_server( &reply->server_id );
 
 	if( server ) {	// we update the replicated index even on unsuccessful snapshot
-		if( reply->type == SERVER_SNAPSHOT ) {
-			server->master_index = reply->last_log_index;	// master_index receives the confirmation of replicas' replica_index
-
-		} else if( reply->type == RAFT_SNAPSHOT ) {
-			logger_fatal( "raft snapshot is not implemented yet" );
-			exit( 1 );
-
-		} else {
-			logger_warn( "unknown snapshot message type: %d", reply->type );
-		}
-
+		server->master_index = reply->last_index;	// master_index receives the confirmation of replicas' replica_index
 	} else {
 		logger_warn( "unable to find raft config server %s", reply->server_id );
 	}
+}
+
+/*
+	Handles snapshot requests of raft configuration
+
+	Note: Locks the raft_state_lock
+*/
+void handle_raft_snapshot_request( raft_snapshot_request_t *request, raft_snapshot_reply_t *reply ) {
+	int match;
+
+	assert( request != NULL );
+	assert( reply != NULL );
+
+	reply->success = 0;
+
+	pthread_mutex_lock( &raft_state_lock );
+
+	match = match_terms( request->term );
+
+	reply->term = me.current_term;
+	strcpy( reply->server_id, me.self_id );
+
+	if( match != E_OUTDATED_MSG ) {
+		if( install_raft_snapshot( &request->snapshot ) ) {
+			strcpy( me.current_leader, request->leader_id );
+			reply->success = 1;
+		}
+	}
+
+	if( reply->success )
+		reply->last_index = me.last_applied;
+	else
+		reply->last_index = get_raft_last_log_index( );
+
+	pthread_mutex_unlock( &raft_state_lock );
+
+	// updating election timeout
+	pthread_mutex_lock( &election_timeout_lock );
+	timespec_get( &election_timeout, TIME_UTC );
+	timespec_add_ms( election_timeout, rand_timeout_ms );
+	pthread_mutex_unlock( &election_timeout_lock );
+}
+
+void handle_raft_snapshot_reply( raft_snapshot_reply_t *reply ) {
+	reply_append_entries_t reply_ae;	// reply append entries msg
+
+	// this function actually is a wrapper of the append entries reply handler since they do the same things
+	reply_ae.last_log_index = reply->last_index;
+	reply_ae.term = reply->term;
+	reply_ae.success = reply->success;
+	strcpy( reply_ae.server_id, reply->server_id );
+
+	handle_append_entries_reply( &reply_ae );
 }
 
 /*
@@ -1772,15 +1947,19 @@ void *worker( ) {
 	repl_req_hdr_t *rep_hdr = NULL;		// replication request header
 	replication_request_t rep_req_msg;
 	replication_reply_t *rep_reply_msg = NULL;
-	unsigned char src_buf[RMR_MAX_SRC];	// rmr source address buffer used to connect to that server to send AppendEntries
+	unsigned char src_buf[sizeof(target_t)];	// rmr source address buffer used to connect to that server to send AppendEntries
 	unsigned char *src_buf_res = NULL;	// used to identify if the rmr_get_src ran successfuly
-	req_snapshot_hdr_t *req_snapshot_hdr = NULL;
-	snapshot_request_t req_snapshot_msg;
-	snapshot_reply_t *reply_snapshot_msg = NULL;
+	xapp_snapshot_hdr_t *req_xapp_snapshot_hdr = NULL;
+	xapp_snapshot_request_t req_xapp_snapshot_msg;
+	xapp_snapshot_reply_t *reply_xapp_snapshot_msg = NULL;
+	raft_snapshot_hdr_t *req_raft_snapshot_hdr = NULL;
+	raft_snapshot_request_t req_raft_snapshot_msg;
+	raft_snapshot_reply_t *reply_raft_snapshot_msg = NULL;
 
-	req_appndtrs_msg.entries = NULL;		// assuring that realloc wont fail due an unsafe pointer
-	rep_req_msg.entries = NULL;				// assuring that realloc wont fail due an unsafe pointer
-	req_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
+	req_appndtrs_msg.entries = NULL;			// assuring that realloc wont fail due an unsafe pointer
+	rep_req_msg.entries = NULL;					// assuring that realloc wont fail due an unsafe pointer
+	req_xapp_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
+	req_raft_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
 
 	while( 1 ) {	// This is a worker thread that processes messages enqueued by the xApp
 
@@ -1818,7 +1997,7 @@ void *worker( ) {
 
 				handle_append_entries_request( &req_appndtrs_msg, reply_appndtrs_msg );
 
-				logger_trace( "replying append entries to %s, term: %lu, last_log_index: %lu, success: %d",
+				logger_trace( "replying  append entries to %s, term: %lu, last_log_index: %lu, success: %d",
 								req_appndtrs_msg.leader_id, reply_appndtrs_msg->term,
 								reply_appndtrs_msg->last_log_index, reply_appndtrs_msg->success );
 
@@ -1903,7 +2082,7 @@ void *worker( ) {
 
 				handle_vote_request( &req_vote_buf, reply_vote_msg );
 
-				logger_debug( "replying	vote request from candidate %s => term: %lu granted: %d",
+				logger_debug( "replying  vote request from candidate %s => term: %lu granted: %d",
 								req_vote_buf.candidate_id, reply_vote_msg->term, reply_vote_msg->granted );
 
 				rft_rts_msg( &msg, VOTE_REPLY, sizeof( *reply_vote_msg ), &req_vote_buf.candidate_id ); // sending reply_vote_msg
@@ -1932,44 +2111,83 @@ void *worker( ) {
 					break;
 				}
 
-				handle_membership_request( req_membership_msg, (char *) src_buf );	// replies are append entries
+				handle_membership_request( req_membership_msg, (target_t *) src_buf );	// replies are append entries
 
 				break;
 
-			case SNAPSHOT_REQ:
-				req_snapshot_hdr = (req_snapshot_hdr_t *) msg->payload;
+			case XAPP_SNAPSHOT_REQ:
+				req_xapp_snapshot_hdr = (xapp_snapshot_hdr_t *) msg->payload;
 
-				server_snapshot_header_to_msg_cpy( req_snapshot_hdr, &req_snapshot_msg );
+				xapp_snapshot_header_to_msg_cpy( req_xapp_snapshot_hdr, &req_xapp_snapshot_msg );
 
-				logger_warn( "receiving snapshot request from %s, type: %d, items: %u, bytes: %lu, master_index: %lu", req_snapshot_msg.server_id,
-							req_snapshot_msg.type, req_snapshot_msg.snapshot.items, req_snapshot_msg.snapshot.dlen, req_snapshot_msg.snapshot.last_log_index );
+				logger_warn( "receiving xapp snapshot request from %s, items: %u, bytes: %lu, master_index: %lu", req_xapp_snapshot_msg.server_id,
+							req_xapp_snapshot_msg.snapshot.items, req_xapp_snapshot_msg.snapshot.dlen, req_xapp_snapshot_msg.snapshot.last_index );
 
 				// reallocating buffer to store snapshot
-				req_snapshot_msg.snapshot.data = (unsigned char *) realloc( req_snapshot_msg.snapshot.data, req_snapshot_msg.snapshot.dlen * sizeof(unsigned char) );
-				if( req_snapshot_msg.snapshot.data == NULL ) {
-					logger_fatal( "unable to reallocate memory to copy snapshot request" );
+				req_xapp_snapshot_msg.snapshot.data = (unsigned char *) realloc( req_xapp_snapshot_msg.snapshot.data, req_xapp_snapshot_msg.snapshot.dlen * sizeof(unsigned char) );
+				if( req_xapp_snapshot_msg.snapshot.data == NULL ) {
+					logger_fatal( "unable to reallocate memory to copy xapp snapshot request" );
 					exit( 1 );
 				}
 				// copying snapshot data
-				memcpy( req_snapshot_msg.snapshot.data, SNAPSHOT_REQ_PAYLOAD_ADDR( msg->payload ), req_snapshot_msg.snapshot.dlen );
+				memcpy( req_xapp_snapshot_msg.snapshot.data, XAPP_SNAPSHOT_PAYLOAD_ADDR( msg->payload ), req_xapp_snapshot_msg.snapshot.dlen );
 
-				reply_snapshot_msg = (snapshot_reply_t *) msg->payload;
+				reply_xapp_snapshot_msg = (xapp_snapshot_reply_t *) msg->payload;
 
-				handle_snapshot_request( &req_snapshot_msg, reply_snapshot_msg );
+				handle_xapp_snapshot_request( &req_xapp_snapshot_msg, reply_xapp_snapshot_msg );
 
-				logger_warn( "replying snapshot request to %s, type: %d, replica_index: %lu, success: %d", req_snapshot_msg.server_id,
-											reply_snapshot_msg->type, reply_snapshot_msg->last_log_index, reply_snapshot_msg->success );
+				logger_warn( "replying xapp snapshot request to %s, replica_index: %lu, success: %d",
+							req_xapp_snapshot_msg.server_id, reply_xapp_snapshot_msg->last_index, reply_xapp_snapshot_msg->success );
 
-				rft_rts_msg( &msg, SNAPSHOT_REPLY, sizeof(snapshot_reply_t), &req_snapshot_msg.server_id );
+				rft_rts_msg( &msg, XAPP_SNAPSHOT_REPLY, sizeof(xapp_snapshot_reply_t), &req_xapp_snapshot_msg.server_id );
 				break;
 
-			case SNAPSHOT_REPLY:
-				reply_snapshot_msg = (snapshot_reply_t *) msg->payload;
+			case XAPP_SNAPSHOT_REPLY:
+				reply_xapp_snapshot_msg = (xapp_snapshot_reply_t *) msg->payload;
 
-				logger_warn( "receiving snapshot reply from %s, type: %d, replica_index: %lu, success: %d", reply_snapshot_msg->server_id,
-								reply_snapshot_msg->type, reply_snapshot_msg->last_log_index, reply_snapshot_msg->success );
+				logger_warn( "receiving xapp snapshot reply from %s, replica_index: %lu, success: %d",
+							reply_xapp_snapshot_msg->server_id, reply_xapp_snapshot_msg->last_index, reply_xapp_snapshot_msg->success );
 
-				handle_snapshot_reply( reply_snapshot_msg );
+				handle_xapp_snapshot_reply( reply_xapp_snapshot_msg );
+				break;
+
+			case RAFT_SNAPSHOT_REQ:
+				req_raft_snapshot_hdr = (raft_snapshot_hdr_t *) msg->payload;
+
+				raft_snapshot_header_to_msg_cpy( req_raft_snapshot_hdr, &req_raft_snapshot_msg );
+
+				logger_warn( "receiving raft snapshot request from %s, term: %lu, last_index: %lu, items: %u, bytes: %lu",
+							req_raft_snapshot_msg.leader_id, req_raft_snapshot_msg.term, req_raft_snapshot_msg.snapshot.last_index,
+							req_raft_snapshot_msg.snapshot.items, req_raft_snapshot_msg.snapshot.dlen );
+
+				// reallocating buffer to store snapshot
+				req_raft_snapshot_msg.snapshot.data = (unsigned char *) realloc( req_raft_snapshot_msg.snapshot.data, req_raft_snapshot_msg.snapshot.dlen * sizeof(unsigned char) );
+				if( req_raft_snapshot_msg.snapshot.data == NULL ) {
+					logger_fatal( "unable to reallocate memory to copy raft snapshot request" );
+					exit( 1 );
+				}
+				// copying snapshot data
+				memcpy( req_raft_snapshot_msg.snapshot.data, RAFT_SNAPSHOT_PAYLOAD_ADDR( msg->payload ), req_raft_snapshot_msg.snapshot.dlen );
+
+				reply_raft_snapshot_msg = (raft_snapshot_reply_t *) msg->payload;
+
+				handle_raft_snapshot_request( &req_raft_snapshot_msg, reply_raft_snapshot_msg );
+
+				logger_warn( "replying raft snapshot request to %s, term: %lu, last_index: %lu, success: %d", req_raft_snapshot_msg.leader_id,
+							reply_raft_snapshot_msg->term, reply_raft_snapshot_msg->last_index, reply_raft_snapshot_msg->success );
+
+				rft_rts_msg( &msg, RAFT_SNAPSHOT_REPLY, sizeof(raft_snapshot_reply_t), &req_raft_snapshot_msg.leader_id );
+				break;
+
+			case RAFT_SNAPSHOT_REPLY:
+
+				reply_raft_snapshot_msg = (raft_snapshot_reply_t *) msg->payload;
+
+				logger_warn( "receiving raft snapshot reply from %s, term: %lu, last_index: %lu, success: %d",
+							reply_raft_snapshot_msg->server_id, reply_raft_snapshot_msg->term,
+							reply_raft_snapshot_msg->last_index, reply_raft_snapshot_msg->success );
+
+				handle_raft_snapshot_reply( reply_raft_snapshot_msg );
 				break;
 
 			default:
@@ -1983,7 +2201,7 @@ void *worker( ) {
 }
 
 /*
-	Returns the index of the last log entry which is replicated among all replica servers
+	Returns the index of the xapp last log entry which is replicated among all replica servers
 */
 index_t get_full_replicated_log_index( ) {
 	unsigned int i;

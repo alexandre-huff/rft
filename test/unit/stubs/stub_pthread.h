@@ -30,3 +30,12 @@ int pthread_create(pthread_t *__restrict__ __newthread, const pthread_attr_t *__
 					void *(*__start_routine)(void *), void *__restrict__ __arg) {
 	return 0;
 }
+
+int pthread_cond_wait(pthread_cond_t *__restrict__ __cond, pthread_mutex_t *__restrict__ __mutex) {
+	return 0;
+}
+
+int pthread_cond_timedwait(pthread_cond_t *__restrict__ __cond, pthread_mutex_t *__restrict__ __mutex,
+					const struct timespec *__restrict__ __abstime) {
+	return 0;
+}

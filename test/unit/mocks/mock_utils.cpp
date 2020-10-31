@@ -19,21 +19,21 @@
 */
 
 /*
-	Mnemonic:	stub_utils.h
-	Abstract:	Provides stub functions of the utils module to build RFT tests
+	Mnemonic:	mock_utils.cpp
+	Abstract:	Implements mock features for the RFT utils module
 
-	Date:		5 September 2020
+	Date:		12 September 2020
 	Author:		Alexandre Huff
 */
 
+#include "CppUTest/TestHarness.h"
+#include "CppUTestExt/MockSupport.h"
+
+extern "C" {
+	#include "utils.h"
+}
+
 int randomize_election_timeout( ) {
-	return 150;
-}
-
-unsigned int parse_uint( char *str ) {
-	return 0;
-}
-
-int parse_int( char *str ) {
-	return 0;
+	return mock().actualCall(__func__)
+		.returnIntValueOrDefault( 0 );
 }

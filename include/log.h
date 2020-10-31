@@ -33,7 +33,7 @@
 #include "rft.h"
 #include "hashtable.h"
 
-#define RAFT_LOG_SIZE	512		// size of the ring to store raft log entries (power of 2)
+#define RAFT_LOG_SIZE	128		// size of the ring to store raft log entries (power of 2)
 #define SERVER_LOG_SIZE	131072	// size of the ring to store server (xApp) log entries (power of 2)
 #define LOG_COUNT_RATIO	0.8		// count ratio of the number of log entries to trigger a snapshot (between 0 and 1)
 
@@ -54,12 +54,17 @@ unsigned int serialize_server_log_entries( index_t from_index, unsigned int *n_e
 											unsigned int *buf_len, int max_msg_size );
 void deserialize_raft_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries );
 void deserialize_server_log_entries( unsigned char *s_entries, unsigned int n_entries, log_entry_t **entries );
-int remove_raft_conflicting_entries( index_t from_index, index_t committed_index );
+void remove_raft_conflicting_entries( index_t prev_log_index, term_t prev_log_term, index_t committed_index );
+int check_raft_log_consistency( index_t prev_log_index, term_t prev_log_term, index_t committed_index );
 log_entry_t *new_raft_log_entry( term_t term, log_entry_type_e type, int command, void *data, size_t len );
 log_entry_t *new_server_log_entry( const char *context, const char *key, int command, void *data, size_t len );
 void lock_server_log( );
 void unlock_server_log( );
-void compact_server_log( );
+void compact_server_log( index_t to_index );
+void compact_raft_log( index_t last_index  );
+void lock_raft_log( );
+void unlock_raft_log( );
+void free_all_log_entries( log_entries_t *log, index_t last_applied_log_index );
 
 
 #endif			/* dup include prevention */

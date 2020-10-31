@@ -2,6 +2,7 @@
 /*
 ==================================================================================
 	Copyright (c) 2020 AT&T Intellectual Property.
+	Copyright (c) 2020 Alexandre Huff.
 
 	Licensed under the Apache License, Version 2.0 (the "License");
 	you may not use this file except in compliance with the License.
@@ -25,9 +26,23 @@
 	Author:		Alexandre Huff
 */
 
+#include "snapshot.h"
+
 /*
 	This is the callback function the RFT calls in the xApp code
 */
 size_t take_snapshot( char **contexts, int nctx, unsigned int *items, unsigned char **data ) {
 	return 0;
+}
+
+void lock_raft_snapshot( ) {
+	return;
+}
+
+void unlock_raft_snapshot( ) {
+	return;
+}
+
+void free_raft_snapshot( raft_snapshot_t *snapshot ) {
+	return;
 }

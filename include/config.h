@@ -30,9 +30,10 @@
 #define _RAFT_CONFIG_H
 
 #include "types.h"
+#include "snapshot.h"
 
 raft_config_t *raft_get_config( );
-int raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index );
+int raft_config_add_server( server_id_t *server_id, target_t *target, index_t last_log_index );
 void raft_config_remove_server( server_id_t *server_id );
 server_t *raft_config_get_server( server_id_t *server_id );
 int has_majority_of_votes( unsigned int rcv_votes );
@@ -46,5 +47,9 @@ int set_configuration_changing( int is_changing );
 int is_configuration_changing( );
 void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigned int n_replicas );
 unsigned int raft_get_num_servers( );
+void create_raft_config_snapshot( unsigned char **data, pipe_metabuf_t *raft_metadata );
+void commit_raft_config_snapshot( raft_snapshot_t *snapshot );
+void lock_raft_config( );
+void unlock_raft_config( );
 
 #endif

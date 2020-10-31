@@ -39,6 +39,14 @@ server_id_t *get_myself_id( ) {
 	return &server_id;
 }
 
-void *send_append_entries( void *raft_server ) {
+void *raft_server( void *raft_server ) {
 	return NULL;
+}
+
+void lock_raft_state( ) {
+	return;
+}
+
+void unlock_raft_state( ) {
+	return;
 }

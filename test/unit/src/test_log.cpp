@@ -40,6 +40,7 @@ extern "C" {
 	#include "../../src/static/logring.c"
 	#include "stubs/stub_logger.h"
 	#include "stubs/stub_snapshot.h"
+	#include "stubs/stub_rft.h"
 }
 
 TEST_GROUP( TestInitLog ) {
@@ -81,7 +82,7 @@ TEST( TestInitLog, InitRaftLog ) {
 	// valid arguments
 	ret = init_log( RAFT_LOG, log_size, 10 );
 	CHECK_TRUE( ret );
-	UNSIGNED_LONGS_EQUAL( 1, raft_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 0, raft_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
 	UNSIGNED_LONGS_EQUAL( 10 * 1048576, raft_log->mthresh );	// convert Mbytes to bytes
@@ -105,7 +106,7 @@ TEST( TestInitLog, InitServerLog ) {
 	// valid arguments
 	ret = init_log( SERVER_LOG, log_size, 10 );
 	CHECK_TRUE( ret );
-	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 0, server_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, server_log->memsize );
 	UNSIGNED_LONGS_EQUAL( 10 * 1048576, server_log->mthresh );	// convert Mbytes to bytes
@@ -113,7 +114,7 @@ TEST( TestInitLog, InitServerLog ) {
 }
 
 TEST_GROUP( TestLog ) {
-	log_entry_t *entry;     // generic log entry pointer
+	log_entry_t *entry;     // generic pointer of a log entry
 	const char *server = "server1";
 	const char *target = "127.0.0.1:4560";
 	server_conf_cmd_data_t config_data;	// RAFT_CONFIG data
@@ -130,12 +131,6 @@ TEST_GROUP( TestLog ) {
 
 		init_log( RAFT_LOG, size, 10 );
 		init_log( SERVER_LOG, size, 10 );
-		raft_log->first_log_index = 1;
-		raft_log->last_log_index = 0;
-		raft_log->memsize = 0;
-		server_log->first_log_index = 1;
-		server_log->last_log_index = 0;
-		server_log->memsize = 0;
 	}
 
 	void teardown() {
@@ -144,7 +139,7 @@ TEST_GROUP( TestLog ) {
 		// removing all raft log entries
 		if( raft_log->last_log_index > 0 ) {
 			mock().disable();	// disabling mock checks (but it still returns the default mock value)
-			remove_raft_conflicting_entries( 1, 0 );
+			remove_raft_conflicting_entries( 0, 0, 0 );
 			mock().enable();
 		}
 
@@ -165,6 +160,27 @@ TEST_GROUP( TestLog ) {
 		}
 	}
 };
+
+/*
+	Tests if all log entries are removed from the logring and
+	also tests if the corresponding log structure is setup accordingly
+	Works for both Raft and xApp logrings
+*/
+TEST( TestLog, FreeAllLogEntries ) {
+	raft_log->memsize = 10;
+	raft_log->index_offset = 2;
+	raft_log->last_log_index = 5;
+	entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &config_data, sizeof(server_conf_cmd_data_t) );
+	log_ring_insert( raft_log->entries, entry );
+
+	free_all_log_entries( raft_log, 8 );
+
+	UNSIGNED_LONGS_EQUAL( 0, log_ring_count( raft_log->entries ) );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
+	UNSIGNED_LONGS_EQUAL( 8, raft_log->index_offset );
+	UNSIGNED_LONGS_EQUAL( 8, raft_log->last_log_index );
+
+}
 
 TEST( TestLog, NewRaftConfigLogEntry ) {
 	server_conf_cmd_data_t entry_data;	// RAFT_CONFIG data from entry
@@ -289,6 +305,10 @@ TEST( TestLog, GetRaftLogEntry_EmptyLog ) {
 }
 
 TEST( TestLog, GetRaftLastLogTerm_EmptyLog ) {
+	mock()
+		.expectOneCall( "get_raft_current_term" )	// should return the current term of the raft state
+		.andReturnValue( 0 );
+
 	UNSIGNED_LONGS_EQUAL( 0, get_raft_last_log_term( ) );
 }
 
@@ -325,6 +345,74 @@ TEST( TestLog, AppendRaftLogEntry ) {
 	mock().checkExpectations();
 
 	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );	// we added the first log entry
+	UNSIGNED_LONGS_EQUAL( sizeof(log_entry_t) + entry->dlen, raft_log->memsize );
+}
+
+TEST( TestLog, AppendRaftLogEntry_TakeSnapshotLogMemory ) {
+	raft_log->memsize = 1025;
+	raft_log->mthresh = 1024;
+
+	mock()
+		.expectOneCall( "take_raft_snapshot" );
+
+	mock()
+		.expectOneCall( "raft_config_get_server" )
+		.withParameter( "server_id", config_data.server_id )
+		.andReturnValue( (void *)NULL );
+	mock()
+		.expectOneCall( "raft_config_add_server" )
+		.withParameter( "server_id", config_data.server_id )
+		.withParameter( "target", config_data.target )
+		.withParameter( "last_log_index", 0 )
+		.andReturnValue( 1 );
+	mock()
+		.expectOneCall( "raft_config_set_server_status" )
+		.withParameter( "server_id", config_data.server_id )
+		.withParameter( "status", VOTING_MEMBER )
+		.andReturnValue( 1 );
+
+	entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &config_data, sizeof(server_conf_cmd_data_t) );
+	CHECK( entry != NULL );
+	append_raft_log_entry( entry );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );	// we added the first log entry
+}
+
+TEST( TestLog, AppendRaftLogEntry_TakeSnapshotLogCount ) {
+	raft_log->cthresh = 1;
+
+	mock()
+		.expectOneCall( "take_raft_snapshot" );
+
+	mock()
+		.expectOneCall( "raft_config_get_server" )
+		.withParameter( "server_id", config_data.server_id )
+		.andReturnValue( (void *)NULL );
+	mock()
+		.expectOneCall( "raft_config_add_server" )
+		.withParameter( "server_id", config_data.server_id )
+		.withParameter( "target", config_data.target )
+		.withParameter( "last_log_index", 0 )
+		.andReturnValue( 1 );
+	mock()
+		.expectOneCall( "raft_config_set_server_status" )
+		.withParameter( "server_id", config_data.server_id )
+		.withParameter( "status", VOTING_MEMBER )
+		.andReturnValue( 1 );
+
+	entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &config_data, sizeof(server_conf_cmd_data_t) );
+	CHECK( entry != NULL );
+
+	log_ring_insert( raft_log->entries, entry );	// added first
+	log_ring_insert( raft_log->entries, entry );	// added second (is the same, no problem)
+
+	append_raft_log_entry( entry );	// now testing the count threshold to take a snapshot (is the same, no problem)
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );	// we added the first log entry
 }
 
 TEST( TestLog, AppendServerLogEntry ) {
@@ -342,6 +430,7 @@ TEST( TestLog, AppendServerLogEntry ) {
 	mock().checkExpectations();
 
 	UNSIGNED_LONGS_EQUAL( 1, server_log->last_log_index );	// we added the first log entry
+	UNSIGNED_LONGS_EQUAL( sizeof(log_entry_t) + entry->dlen + entry->clen + entry->klen, server_log->memsize );
 }
 
 TEST( TestLog, AppendServerLogEntry_TakeSnapshotLogMemory ) {
@@ -406,9 +495,6 @@ TEST_GROUP( TestRaftLog ) {
 		me.commit_index = 0;
 
 		init_log( RAFT_LOG, 64, 10 );
-		raft_log->first_log_index = 1;
-		raft_log->last_log_index = 0;
-		raft_log->memsize = 0;
 
 		mock().disable();	// disabling mock checks (but it still returns the default mock value)
 
@@ -417,7 +503,7 @@ TEST_GROUP( TestRaftLog ) {
 			snprintf( config_data[i].server_id, sizeof(server_id_t), "server%d", i + 1 );
 			snprintf( config_data[i].target, sizeof(server_id_t), "127.0.0.%d:4560", i + 1 );
 
-			entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &config_data[i], sizeof(server_conf_cmd_data_t) );	// server1
+			entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &config_data[i], sizeof(server_conf_cmd_data_t) );
 			CHECK( entry != NULL );
 			append_raft_log_entry( entry );
 		}
@@ -430,7 +516,7 @@ TEST_GROUP( TestRaftLog ) {
 
 		if( raft_log->last_log_index > 0 ) {
 			mock().disable();	// disabling mock checks (but it still returns the default mock value)
-			remove_raft_conflicting_entries( 1, me.commit_index );
+			remove_raft_conflicting_entries( 0, 0, 0 );
 			mock().enable();
 		}
 
@@ -451,13 +537,13 @@ TEST( TestRaftLog, RemoveAllRaftConflictingEntries ) {
 		.expectOneCall( "raft_config_remove_server" )
 		.withParameter( "server_id", config_data[0].server_id );
 
-	// removing all log entries ( from the first one )
-	int removed = remove_raft_conflicting_entries( 1, me.commit_index );
-	CHECK_TRUE( removed );
+	// removing all log entries
+	remove_raft_conflicting_entries( 0, 0, 0 );
 
 	mock().checkExpectations();
 
 	CHECK_EQUAL( 0, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
 }
 
 TEST( TestRaftLog, RemoveTheLastRaftConflictingEntry ) {
@@ -465,45 +551,73 @@ TEST( TestRaftLog, RemoveTheLastRaftConflictingEntry ) {
 		.expectOneCall( "raft_config_remove_server" )
 		.withParameter( "server_id", config_data[1].server_id );
 
-	// removing the second log entry
-	int removed = remove_raft_conflicting_entries( 2, me.commit_index );
-	CHECK_TRUE( removed );
+	log_entry_t *e = log_ring_get( raft_log->entries, 2 );
+	CHECK_TRUE( e );
+	size_t msize = raft_log->memsize - sizeof(log_entry_t) - e->dlen;
+
+	// removing only the second log entry (the previous has index 1 and term 1)
+	remove_raft_conflicting_entries( 1, 1, 0 );
 
 	mock().checkExpectations();
 
 	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( msize, raft_log->memsize );
 }
 
 /*
-	Trying to remove a committed log index, i.e. from_index <= commit_index
+	Trying to remove a committed log index (from_index < commit_index)
 */
-TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexLTCommitIndex ) {
-	int removed;
+TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexLowerThanCommitIndex ) {
 
 	me.commit_index = 2;
-	removed = remove_raft_conflicting_entries( 2, me.commit_index );	// equal
-	CHECK_FALSE( removed );
+	remove_raft_conflicting_entries( setup_entries - 1, 1, me.commit_index );	// lower than
 
-	removed = remove_raft_conflicting_entries( 1, me.commit_index );	// lower than
-	CHECK_FALSE( removed );
-
-	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
-
-	me.commit_index = 0;	// allowing tear down remove all log entries
+	UNSIGNED_LONGS_EQUAL( setup_entries, raft_log->last_log_index );
 }
 
-TEST( TestRaftLog, RemoveRaftConflictingEntries_FromIndexZero ) {
-	int removed = remove_raft_conflicting_entries( 0, me.commit_index );
-	CHECK_FALSE( removed );
+/*
+	Trying to remove a committed log index (from_index == commit_index)
+*/
+TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexEqualsCommitIndex ) {
 
-	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+	me.commit_index = 2;
+	remove_raft_conflicting_entries( setup_entries, 1, me.commit_index );	// equal
+
+	UNSIGNED_LONGS_EQUAL( setup_entries, raft_log->last_log_index );
 }
 
 TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexGreaterThanHead ) {
-	int removed = remove_raft_conflicting_entries( 100, me.commit_index );
-	CHECK_FALSE( removed );
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[0].server_id );
 
-	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+	remove_raft_conflicting_entries( 100, 1, 0 );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->last_log_index );
+}
+
+/*
+	Removes a conflicting entry with the matching index but an conflicting term
+	Should stop at the committed_index
+*/
+TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexButTerm ) {
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+	/*
+		stored logs have term 1
+		we assume the commit index is 1
+	*/
+	remove_raft_conflicting_entries( 2, 2, 1 );
+
+	mock().checkExpectations();
+
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );
 }
 
 /*
@@ -513,7 +627,7 @@ TEST( TestRaftLog, RemoveRaftConflictingEntries_IndexGreaterThanHead ) {
 TEST( TestRaftLog, RemoveRaftConflictingEntries_DeleteMember ) {
 	log_entry_t *del_entry;
 	server_conf_cmd_data_t del_server;
-	int removed;
+	size_t msize;
 
 	snprintf( del_server.server_id, sizeof(server_id_t), "server3" );
 	snprintf( del_server.target, sizeof(server_id_t), "127.0.0.3:4560" );
@@ -539,12 +653,98 @@ TEST( TestRaftLog, RemoveRaftConflictingEntries_DeleteMember ) {
 		.withParameter( "status", VOTING_MEMBER )
 		.andReturnValue( 1 );
 
-	// removing the this DEL_MEMBER conflicting log entry
-	removed = remove_raft_conflicting_entries( 3, me.commit_index );
+	// calculating the expected size of the log after removing the conflicting entry
+	msize = raft_log->memsize;
+	msize -= sizeof(log_entry_t) + del_entry->dlen;
+
+	// removing the DEL_MEMBER conflicting log entry
+	remove_raft_conflicting_entries( setup_entries, 1, me.commit_index );
 	mock().checkExpectations();
 
-	CHECK_TRUE( removed );
-	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( setup_entries, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( msize, raft_log->memsize );
+}
+
+TEST( TestRaftLog, CheckRaftLogConsistency_LogsConsistent ) {
+	int ret = check_raft_log_consistency( setup_entries, 1, 1 );
+	CHECK_TRUE( ret );
+
+	UNSIGNED_LONGS_EQUAL( setup_entries, raft_log->last_log_index );
+}
+
+TEST( TestRaftLog, CheckRaftLogConsistency_ConflictingHigherTerm ) {
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_term" )
+		.andReturnValue( 0 );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_index" )
+		.andReturnValue( 0 );
+
+	int ret = check_raft_log_consistency( setup_entries, 2, 1 );
+	mock().checkExpectations();
+
+	CHECK_FALSE( ret );
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );
+}
+
+TEST( TestRaftLog, CheckRaftLogConsistency_ConflictingLowerTerm ) {
+	entry = get_raft_log_entry( raft_log->last_log_index );
+	entry->term = 2;
+
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_term" )
+		.andReturnValue( 0 );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_index" )
+		.andReturnValue( 0 );
+
+	int ret = check_raft_log_consistency( setup_entries, 1, 1 );
+	mock().checkExpectations();
+
+	CHECK_FALSE( ret );
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );
+}
+
+TEST( TestRaftLog, CheckRaftLogConsistency_ConflictingHigherIndex ) {
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_term" )
+		.andReturnValue( 0 );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_index" )
+		.andReturnValue( 0 );
+
+	int ret = check_raft_log_consistency( setup_entries + 1, 1, 1 );
+	mock().checkExpectations();
+
+	CHECK_FALSE( ret );
+}
+
+TEST( TestRaftLog, CheckRaftLogConsistency_ConflictingLowerIndex ) {
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_term" )
+		.andReturnValue( 0 );
+	mock()
+		.expectOneCall( "get_raft_snapshot_last_index" )
+		.andReturnValue( 0 );
+	mock()
+		.expectOneCall( "raft_config_remove_server" )
+		.withParameter( "server_id", config_data[1].server_id );
+
+	// commit_index is 1, thus, only the second server is removed
+	int ret = check_raft_log_consistency( 0, 1, 1 );
+	mock().checkExpectations();
+
+	CHECK_FALSE( ret );
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->last_log_index );
 }
 
 TEST( TestRaftLog, GetRaftLogEntry_LogInitialized ) {
@@ -581,6 +781,9 @@ TEST( TestRaftLog, SerializeRaftLogEntries ) {
 	// test with insufficient message size (1 byte)
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, 1 );
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
+	UNSIGNED_LONGS_EQUAL( 0, n_entries );
+	UNSIGNED_LONGS_EQUAL( 0, buf_len);
+	CHECK_FALSE( buf );
 
 	for( int i = 0; i < setup_entries; i++ ) {
 		esize += RAFT_LOG_ENTRY_HDR_SIZE + exp[i]->dlen;
@@ -590,11 +793,17 @@ TEST( TestRaftLog, SerializeRaftLogEntries ) {
 	n_entries = setup_entries;	// the serialize function changes *n_entries
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN );
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
+	UNSIGNED_LONGS_EQUAL( 0, n_entries );
+	UNSIGNED_LONGS_EQUAL( 0, buf_len);
+	CHECK_FALSE( buf );
 
 	// test with insufficient message size (passing only 1 byte to the message payload)
 	n_entries = setup_entries;
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN + 1 );
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
+	UNSIGNED_LONGS_EQUAL( 0, n_entries );
+	UNSIGNED_LONGS_EQUAL( 0, buf_len);
+	CHECK_FALSE( buf );
 
 	/*
 		forcing to get a non-existent log index (or a compacted index)
@@ -604,12 +813,17 @@ TEST( TestRaftLog, SerializeRaftLogEntries ) {
 	bytes = serialize_raft_log_entries( 0, &n_entries, &buf, &buf_len, APND_ENTR_HDR_LEN + 1 );
 	LONGS_EQUAL( ENODATA, errno )
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
+	UNSIGNED_LONGS_EQUAL( 0, n_entries );
+	UNSIGNED_LONGS_EQUAL( 0, buf_len);
+	CHECK_FALSE( buf );
 
 	// testing with the same message size than the serialized log entries size + append entries header length
 	n_entries = setup_entries;	// the serialize function changes *n_entries
 	bytes = serialize_raft_log_entries( 1, &n_entries, &buf, &buf_len, esize + APND_ENTR_HDR_LEN );
 	UNSIGNED_LONGS_EQUAL( esize, bytes );
-
+	UNSIGNED_LONGS_EQUAL( setup_entries, n_entries );
+	UNSIGNED_LONGS_EQUAL( esize, buf_len);
+	CHECK_TRUE( buf );
 
 	if( buf )
 		free( buf );
@@ -673,6 +887,30 @@ TEST( TestRaftLog, DeserializeRaftLogEntries ) {
 		free( buf );
 }
 
+TEST( TestRaftLog, CompactAllRaftLogs ) {
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->index_offset );
+	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+
+	compact_raft_log( 2 );
+
+	UNSIGNED_LONGS_EQUAL( 2, raft_log->index_offset );
+	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->memsize );
+}
+
+TEST( TestRaftLog, CompactOneRaftLog ) {
+	size_t size = raft_log->memsize;
+
+	UNSIGNED_LONGS_EQUAL( 0, raft_log->index_offset );
+	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+
+	compact_raft_log( 1 );	// only the first log entry is fully replicated
+
+	UNSIGNED_LONGS_EQUAL( 1, raft_log->index_offset );
+	UNSIGNED_LONGS_EQUAL( 2, raft_log->last_log_index );
+	UNSIGNED_LONGS_EQUAL( size / 2, raft_log->memsize );	// we had only two entries with equal size
+}
+
 /* ===================================== Next group of tests ===================================== */
 /*
 	This group of tests will test all SERVER log functions that require entries appended to the corresponding log
@@ -688,9 +926,6 @@ TEST_GROUP( TestServerLog ) {
 
 	void setup() {
 		init_log( SERVER_LOG, 64, 10 );
-		server_log->first_log_index = 1;
-		server_log->last_log_index = 0;
-		server_log->memsize = 0;
 
 		mock().disable();
 		for( int i = 0; i < setup_entries; i++ ) {
@@ -706,12 +941,7 @@ TEST_GROUP( TestServerLog ) {
 
 		if( server_log->entries ) {
 			// freeing all log entries
-			index_t llidx = get_server_last_log_index( );
-			for( int i = llidx; i > 0; i-- ) {
-				entry = get_server_log_entry( i );
-				if( entry )
-					free_log_entry( entry );
-			}
+			free_all_log_entries( server_log, 0 );
 			// freeing the log itself
 			free( server_log->entries->data );
 			free( server_log->entries );
@@ -752,7 +982,7 @@ TEST( TestServerLog, SerializeServerLogEntries ) {
 	UNSIGNED_LONGS_EQUAL( 0, bytes );
 
 	for( int i = 0; i < setup_entries; i++ ) {
-		esize += SERVER_LOG_ENTRY_HDR_SIZE + exp[i]->dlen + exp[i]->clen + exp[i]->klen;
+		esize += XAPP_LOG_ENTRY_HDR_SIZE + exp[i]->dlen + exp[i]->clen + exp[i]->klen;
 	}
 
 	// test with insufficient message size (passing only the required message header size)
@@ -795,7 +1025,7 @@ TEST( TestServerLog, DeserializeServerLogEntries ) {
 	log_entry_t **exp = (log_entry_t **) server_log->entries->data;
 
 	for( i = 0; i < setup_entries; i++ ) {
-		esize += SERVER_LOG_ENTRY_HDR_SIZE + exp[i]->dlen + exp[i]->clen + exp[i]->klen;
+		esize += XAPP_LOG_ENTRY_HDR_SIZE + exp[i]->dlen + exp[i]->clen + exp[i]->klen;
 	}
 
 	n_entries = setup_entries;	// the serialize function changes *n_entries
@@ -835,18 +1065,12 @@ TEST( TestServerLog, DeserializeServerLogEntries ) {
 }
 
 TEST( TestServerLog, CompactAllServerLogs ) {
-	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
 
-	mock()
-		.expectOneCall( "get_full_replicated_log_index" )
-		.andReturnValue( 2 );	// only the first log entry is fully replicated
+	compact_server_log( 2 );
 
-	compact_server_log( );
-
-	mock().checkExpectations();
-
-	UNSIGNED_LONGS_EQUAL( 3, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 2, server_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( 0, server_log->memsize );
 }
@@ -854,18 +1078,12 @@ TEST( TestServerLog, CompactAllServerLogs ) {
 TEST( TestServerLog, CompactOneServerLog ) {
 	size_t size = server_log->memsize;
 
-	UNSIGNED_LONGS_EQUAL( 1, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 0, server_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
 
-	mock()
-		.expectOneCall( "get_full_replicated_log_index" )
-		.andReturnValue( 1 );	// only the first log entry is fully replicated
+	compact_server_log( 1 );	// only the first log entry is fully replicated
 
-	compact_server_log( );
-
-	mock().checkExpectations();
-
-	UNSIGNED_LONGS_EQUAL( 2, server_log->first_log_index );
+	UNSIGNED_LONGS_EQUAL( 1, server_log->index_offset );
 	UNSIGNED_LONGS_EQUAL( 2, server_log->last_log_index );
 	UNSIGNED_LONGS_EQUAL( size / 2, server_log->memsize );	// we had only two entries with equal size
 }

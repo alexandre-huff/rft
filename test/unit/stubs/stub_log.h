@@ -2,6 +2,7 @@
 /*
 ==================================================================================
 	Copyright (c) 2020 AT&T Intellectual Property.
+	Copyright (c) 2020 Alexandre Huff.
 
 	Licensed under the Apache License, Version 2.0 (the "License");
 	you may not use this file except in compliance with the License.
@@ -25,6 +26,8 @@
 	Author:		Alexandre Huff
 */
 
+#include "types.h"
+
 void lock_server_log( ) {
 	return;
 }
@@ -33,6 +36,6 @@ void unlock_server_log( ) {
 	return;
 }
 
-void compact_server_log( ) {
+void compact_server_log( index_t to_index ) {
 	return;
 }

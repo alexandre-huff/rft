@@ -64,7 +64,7 @@ Contributions to the development of unit tests are really welcome!
 
 The RFT provides a clean and lightweight, but powerful API to the developers that want to add fault tolerance features to their xApps. The main functions that an xApp developer has to call from the RFT library are:
 
-* rft_init( mrc, port, apply_state_cb ) - initializes the RFT library passing the RMR context and port, as well as the call back function that applies the state of the replicated state machine
+* rft_init( mrc, port, apply_state_cb, take_snapshot_cb, install_snapshot_cb ) - initializes the RFT library passing the RMR context and port, as well as registers three callback functions to the xApp state machine
 
 * rft_enqueue_msg( msg ) - pass a message to the RFT library. A set of messages are reserved to the RFT and xApp only needs to forward that messages to the RFT by using this function
 
@@ -77,6 +77,10 @@ The RFT provides a clean and lightweight, but powerful API to the developers tha
     * len: holds the size of the value
 
 * apply_state_cb( command, context, key, value, len ) - calls the command of the finite state machine. This function needs to be implemented by the xApp developer and it will be called by the RFT library (call back) when a command needs to be applied on the replicated state machine.
+
+* take_snapshot_cb( contexts, nctx, items, data ) - calls the function to serialize all primary contexts at the xApp replica.
+
+* install_snapshot_cb( items, data ) - calls the function do desserialize the received snapshot at the xApp replica.
 
 ## Examples
 

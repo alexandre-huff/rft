@@ -2,6 +2,7 @@
 /*
 ==================================================================================
 	Copyright (c) 2020 AT&T Intellectual Property.
+	Copyright (c) 2020 Alexandre Huff.
 
 	Licensed under the Apache License, Version 2.0 (the "License");
 	you may not use this file except in compliance with the License.
@@ -49,21 +50,48 @@ extern "C" {
 			.returnIntValueOrDefault( 0 );
 	}
 
+	pid_t __wrap_waitpid(pid_t __pid, int *__stat_loc, int __options) {
+		return (pid_t)mock()
+			.actualCall( "waitpid" )
+			.withParameter( "__pid", __pid )
+			.withOutputParameter( "__stat_loc", __stat_loc )
+			.withParameter( "__options", __options )
+			.returnIntValueOrDefault( 0 );
+	}
+
 	ssize_t __wrap_write(int __fd, const void *__buf, size_t __n) {
 		return (ssize_t)mock()
 			.actualCall( "write" )
 			.withIntParameter( "__fd", __fd )
-			.withParameter( "__buf", __buf )
-			.withIntParameter( "__n", __n )
+			.withConstPointerParameter( "__buf", __buf )
+			.withUnsignedLongIntParameter( "__n", __n )
 			.returnLongIntValueOrDefault( 0 );
 	}
 
 	ssize_t __wrap_read(int __fd, void *__buf, size_t __nbytes) {
+
+		if( mock().hasData( "read_pipe" ) ) {
+				/*
+					In this case we do not mock the exact behavior of the read system call, instead, we check
+					if the read_pipe function passes the correct ptr value to the read system call
+				*/
+			return (ssize_t)mock()
+				.actualCall( "read" )
+				.withIntParameter( "__fd", __fd )
+				.withPointerParameter( "__buf", __buf )
+				.withUnsignedLongIntParameter( "__nbytes", __nbytes )
+				.returnLongIntValueOrDefault( 0 );
+		}
+
+		/*
+			Here the __buf is returned and mocks the exact behavior of the read system call
+			It is used by other functions that depends on and call the read_pipe function
+		*/
 		return (ssize_t)mock()
 			.actualCall( "read" )
 			.withIntParameter( "__fd", __fd )
 			.withOutputParameter( "__buf", __buf )
-			.withIntParameter( "__nbytes", __nbytes )
+			.withUnsignedLongIntParameter( "__nbytes", __nbytes )
 			.returnLongIntValueOrDefault( 0 );
 	}
 

@@ -41,6 +41,9 @@
 #include "logger.h"
 #include "utils.h"
 #include "config.h"
+#include "mtl.h"
+#include "snapshot.h"
+#include "log.h"
 
 
 pthread_mutex_t config_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -57,6 +60,20 @@ static raft_config_t config = {
 */
 raft_config_t *raft_get_config( ) {
 	return &config;
+}
+
+/*
+	Acquires the mutex of the raft configuration
+*/
+void lock_raft_config( ) {
+	pthread_mutex_lock( &config_lock );
+}
+
+/*
+	Releases the mutex of the raft configuration
+*/
+void unlock_raft_config( ) {
+	pthread_mutex_unlock( &config_lock );
 }
 
 /*
@@ -117,18 +134,17 @@ server_t *raft_config_get_server( server_id_t *server_id ) {
 
 	On success, returns 1. On error, 0 is returned.
 	An error means: if the server_id was added in a previous call, or the server's thread could not be created
-	if server's thread was not created, then the server is removed from configuration
+	If server's thread was not created, then the server is removed from configuration
+
+	Note: This is an internal function of the config module and must be called by a wrapper funtion
+	inside this module
+
+	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the
+	configuration lock
 */
-int raft_config_add_server( server_id_t *server_id, char *target, index_t last_log_index ) {
+static inline int add_server( server_id_t *server_id, target_t *target, index_t last_log_index ) {
 	int ret;
 	server_t *server = NULL;
-
-	if( target == NULL ) {
-		logger_error( "invalid target: null?" );
-		return 0;
-	}
-
-	pthread_mutex_lock( &config_lock );
 
 	server = get_server( server_id );
 	if( server != NULL ) {		// checking if this server was already added to the configuration
@@ -140,11 +156,14 @@ int raft_config_add_server( server_id_t *server_id, char *target, index_t last_l
 			and the follower will not try to apply the same command twice
 		*/
 		server->match_index = last_log_index;
-		server->master_index = last_log_index;
 		server->next_index = last_log_index + 1;
+		/*
+			last_log_index is ok since the server has crashed or restarted, thus master index is 0 in membership request
+			note that append_entries does not add a raft server if it was already added
+		*/
+		server->master_index = last_log_index;
 		pthread_mutex_unlock( &server->index_lock );
 
-		pthread_mutex_unlock( &config_lock );
 		return 0;
 	}
 
@@ -178,8 +197,10 @@ int raft_config_add_server( server_id_t *server_id, char *target, index_t last_l
 	pthread_mutex_init( &server->index_lock, NULL );
 
 	server->voted_for_me = 0;
-	strcpy( server->server_id, *server_id );
-	strcpy( server->target, target );
+	memccpy( server->server_id, *server_id, '\0', sizeof(server_id_t) - 1 );
+	server->server_id[sizeof(server_id_t) - 1] = '\0';
+	memccpy( server->target, *target, '\0', sizeof(target_t) - 1 );
+	server->target[sizeof(target_t) - 1] = '\0';
 	server->replied_ts.tv_sec = 0;
 	server->replied_ts.tv_nsec = 0;
 	server->hb_timeouts = 0;
@@ -187,23 +208,47 @@ int raft_config_add_server( server_id_t *server_id, char *target, index_t last_l
 	server->master_index = 0;
 	server->active = SHUTDOWN;
 
-	pthread_mutex_unlock( &config_lock );
-
 	/*
 		does not need to create a thread server for myself (as I do not need to replicate logs to myself)
 	*/
 	if( strcmp( *server_id, *get_myself_id( ) ) != 0 ) {
-		ret = pthread_create( &server->th_id, NULL, send_append_entries, (void *) server ); // starting thread to send AppendEntries
-
+		ret = pthread_create( &server->th_id, NULL, raft_server, (void *) server ); // starting thread to send Append Entries
 		if( ret != 0 ) {
 			logger_error( "unable to create thread for server %s", server_id );
 			raft_config_remove_server( server_id );
 			return 0;
 		}
-
 	}
 
 	return 1;
+}
+
+/*
+	Adds a new server to the raft configuration as non-voting member
+
+	Leader add server cluster configuration from membership requests
+	Followers add servers in their configuration from AppendEntries messages
+
+	On success, returns 1. On error, 0 is returned.
+	An error means: if the server_id was added in a previous call, or the server's thread could not be created
+	If server's thread was not created, then the server is removed from configuration
+*/
+int raft_config_add_server( server_id_t *server_id, target_t *target, index_t last_log_index ) {
+	int ret;
+
+	// This is a wrapper function as we have to lock the configuration mutex
+	if( target == NULL ) {
+		logger_error( "invalid target: null?" );
+		return 0;
+	}
+
+	pthread_mutex_lock( &config_lock );
+
+	ret = add_server( server_id, target, last_log_index );
+
+	pthread_mutex_unlock( &config_lock );
+
+	return ret;
 }
 
 /*
@@ -211,12 +256,16 @@ int raft_config_add_server( server_id_t *server_id, char *target, index_t last_l
 
 	A server is removed from the raft configuration when a remove membership log entry is
 	added to the log, or when removing conflicting log entries
+
+	Note: This is an internal function of the config module and must be called by a wrapper funtion
+	inside this module
+
+	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the
+	configuration lock
 */
-void raft_config_remove_server( server_id_t *server_id ) {
+static inline void remove_server( server_id_t *server_id ) {
 	unsigned int i;
 	server_t *server;
-
-	pthread_mutex_lock( &config_lock );
 
 	server = get_server( server_id );
 
@@ -276,6 +325,19 @@ void raft_config_remove_server( server_id_t *server_id ) {
 	} else {
 		logger_warn( "server %s not found in raft configuration", server_id );
 	}
+}
+
+/*
+	Removes a server from the raft configuration
+
+	A server is removed from the raft configuration when a remove membership log entry is
+	added to the log, or when removing conflicting log entries
+*/
+void raft_config_remove_server( server_id_t *server_id ) {
+	// This is a wrapper function as we have to lock the configuration mutex
+	pthread_mutex_lock( &config_lock );
+
+	remove_server( server_id );
 
 	pthread_mutex_unlock( &config_lock );
 }
@@ -289,19 +351,44 @@ void raft_config_remove_server( server_id_t *server_id ) {
 
 	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the
 	configuration lock
-*/
-static inline void set_server_voting_status( server_t *server, raft_voting_member_e status ) {
-	server->status = status;
 
-	if( status == VOTING_MEMBER ) {
-		assert( config.voting_members < config.size );
-		config.voting_members++;
-		logger_debug( "changed status of raft server %s to VOTING_MEMBER", server->server_id );
-	} else {
-		assert( config.voting_members > 0 );
-		config.voting_members--;
-		logger_debug( "changed status of raft server %s to NON_VOTING_MEMBER", server->server_id );
+	Returns 1 if the server was found and the status was changed or had been previously configured.
+	On error, 0 is returned and errno is set to indicate the error.
+	Error codes:
+		- ENODATA: server not found
+		- EINVAL: invalid status argument
+*/
+static inline int set_server_voting_status( server_id_t *server_id, raft_voting_member_e status ) {
+	server_t *server;
+
+	if( ( status != VOTING_MEMBER ) && ( status != NON_VOTING_MEMBER ) ) {
+		logger_error( "invalid raft voting status: %d", status );
+		errno = EINVAL;
+		return 0;
 	}
+
+	server = get_server( server_id );
+	if( server != NULL ) {
+		if( server->status != status ) {	// we can only increment/decrement if the state has changed
+			if( status == VOTING_MEMBER ) {
+				assert( config.voting_members < config.size );
+				config.voting_members++;
+				logger_debug( "changed status of raft server %s to VOTING_MEMBER", server->server_id );
+
+			} else {
+				assert( config.voting_members > 0 );
+				config.voting_members--;
+				logger_debug( "changed status of raft server %s to NON_VOTING_MEMBER", server->server_id );
+			}
+			server->status = status;
+		}
+
+	} else {	// server not found
+		errno = ENODATA;
+		return 0;
+	}
+
+	return 1;
 }
 
 /*
@@ -339,26 +426,14 @@ int raft_config_set_new_vote( server_id_t *server_id ) {
 */
 int raft_config_set_server_status( server_id_t *server_id, raft_voting_member_e status ) {
 	/*
-		This is a wrapper function used to avoid duplicate the code of the config_set_server_voting_status function,
-		since it can be called from different functions from this module
-		It also do not requires that two searches of the server_id needs to be done, as well as, avoid to release the
-		configuration lock, and lock it again on the next function in this same module
+		This is a wrapper function used to avoid duplicate the code of the set_server_voting_status function,
+		which can be called from different functions from this module
 	*/
-	int changed = 0;
-	server_t *server;
-
-	if( status != NON_VOTING_MEMBER && status != VOTING_MEMBER ) {
-		logger_error( "invalid raft voting member status" );
-		return 0;
-	}
+	int changed;
 
 	pthread_mutex_lock( &config_lock );
 
-	server = get_server( server_id );
-	if( server != NULL ) {
-		set_server_voting_status( server, status );
-		changed = 1;
-	}
+	changed = set_server_voting_status( server_id, status );
 
 	pthread_mutex_unlock( &config_lock );
 
@@ -640,4 +715,109 @@ void get_replica_servers( server_id_t *me_self_id, replicas_t *replicas, unsigne
 	/* temporary code up to here */
 
 	pthread_mutex_unlock( &config_lock );
+}
+
+/*
+	Creates a new raft configuration snaphot
+
+	Information of all servers in the cluster is serialized in an array of bytes
+	to be sent over the network to another cluster member (often new members)
+	The information of all servers is serialized in the same order as they were added to the cluster.
+	This function is meant to be called by the child process while taking the snapshot
+
+	Parameters:
+		data: array of bytes in which the snapshot will be serialized into. It is reallocated by this function.
+		raft_metadata: stores metadata information regarding the raft state stored in the serialized bytes.
+
+	Both data and raft_metadata are sent over the network through the send_raft_snapshot function
+*/
+void create_raft_config_snapshot( unsigned char **data, pipe_metabuf_t *raft_metadata ) {
+	unsigned int i;
+	server_t *server;
+	raft_server_snapshot_t *rserver;	// snapshot server
+	size_t offset = 0;
+	/*
+		we do not need to lock things here since the snapshot is taken by the child process, and
+		only the snapshot thread is running after the fork system call
+	*/
+	*data = (unsigned char *) realloc( *data, config.size * sizeof(raft_server_snapshot_t) );
+	if( data == NULL ) {
+		logger_fatal( "unable to reallocate buffer to take raft snapshot" );
+		exit( 1 );
+	}
+
+	/*
+		server_id | target | raft_voting_member_e
+	*/
+	for( i = 0; i < config.size; i++ ) {
+		server = config.servers[i];
+
+		rserver = (raft_server_snapshot_t *) (*data + offset);
+		memcpy( &rserver->server_id, &server->server_id, sizeof(server_id_t) );
+		memcpy( &rserver->target, &server->target, sizeof(target_t) );
+		rserver->status = htonl( server->status );	// we have to convert it here with the serialization
+
+		offset += sizeof(raft_server_snapshot_t);
+	}
+
+	raft_metadata->items = config.size;
+	raft_metadata->last_index = get_raft_last_applied( );
+	raft_metadata->last_term = get_raft_current_term( );
+	raft_metadata->dlen = offset;	// which is the length of the data as well
+}
+
+/*
+	Commits the received snapshot in the config module
+
+	This function is in charge of deserializing the information of the servers received in
+	the snapshot and reconstructing a fresh raft state configuration following the same order
+	of servers they were added to the array of bytes (in which the servers were added in the
+	same order they were added to the cluster configuration).
+
+	Parameters:
+		snapshot: contains the serialized array of servers and metadata information of the raft state
+*/
+void commit_raft_config_snapshot( raft_snapshot_t *snapshot  ) {
+	unsigned int i;
+	size_t offset = 0;
+	log_entries_t *log;
+	raft_server_snapshot_t *rserver;
+
+	// the lock order must be: raft state (rft.c), raft log (log.c), and raft config (config.c)
+	// raft_state is already locked
+	lock_raft_log( );
+	pthread_mutex_lock( &config_lock );
+
+	// cleaning all raft config and log information
+	while( config.size > 0 ) {
+		remove_server( &config.servers[0]->server_id );	// [0] is ok since config.size is > 0
+	}
+	log = get_raft_log( );
+	free_all_log_entries( log, snapshot->last_index );
+	// cleaning up to here
+
+	// installing snapshot
+	set_raft_current_term( snapshot->last_term );
+	set_raft_last_applied( snapshot->last_index );
+	set_raft_commit_index( snapshot->last_index );
+
+	for( i = 0; i < snapshot->items; i++ ) {
+		rserver = (raft_server_snapshot_t *) (snapshot->data + offset);
+		if( ! add_server( &rserver->server_id, &rserver->target, snapshot->last_index ) ) {
+			logger_fatal( "unable to create a raft server while installing the snapshot" );
+			exit( 1 );
+		}
+		if( ! set_server_voting_status( &rserver->server_id, ntohl( rserver->status ) ) ) {
+			logger_fatal( "unable setting raft voting status %d for server %s (%s)",
+				rserver->status, rserver->server_id, strerror( errno ) );
+			exit( 1 );
+		}
+
+		offset += sizeof(raft_server_snapshot_t);
+	}
+
+	pthread_mutex_unlock( &config_lock );
+	update_replica_servers( );	// calls get_replica_servers which locks the config_lock
+
+	unlock_raft_log( );
 }

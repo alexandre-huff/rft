@@ -2,6 +2,7 @@
 /*
 ==================================================================================
 	Copyright (c) 2020 AT&T Intellectual Property.
+	Copyright (c) 2020 Alexandre Huff.
 
 	Licensed under the Apache License, Version 2.0 (the "License");
 	you may not use this file except in compliance with the License.
@@ -23,6 +24,9 @@
 
 	Date:		13 May 2020
 	Author:		Alexandre Huff
+
+	Updated:	30 Sep 2020 and 27 Oct 2020
+				Implemented raft snapshotting
 */
 
 
@@ -36,52 +40,90 @@
 #include <pthread.h>
 #include <assert.h>
 #include <sysexits.h>
+#include <limits.h>
 
 #include "snapshot.h"
 #include "types.h"
 #include "rft.h"
 #include "logger.h"
 #include "log.h"
+#include "config.h"
+#include "rft_private.h"
+#include "mtl.h"
 #include "static/hashtable.c"
 
 
-int in_progress = 0;			// defines if the snapshot is in progress
-int ctx_pipe[2];				// pipe for context snapshotting
-ctx_metabuf_t ctx_metabuf;		// metadata of the snapshot taken from the xapp
+int xapp_in_progress = 0;		// defines if the xapp snapshot is in progress (taking | installing)
+int raft_in_progress = 0;		// defines if the raft snapshot is in progress (taking | installing)
+int xapp_pipe[2];				// pipe for the xapp contexts snapshotting
+int raft_pipe[2];				// pipe for the raft snapshotting
+pid_t xapp_pid;
+pid_t raft_pid;
+pipe_metabuf_t xapp_metabuf;	// metadata of the snapshot taken from the xapp
+pipe_metabuf_t raft_metabuf;	// metadata of the snapshot taken from the raft configuration
 primary_ctx_t pctxs;			// stores temporary primary contexts which will be snapshotted
-snapshot_t ctx_snapshot = {		// stores the snapshot, and must only being accessed by this module (do not use in other modules)
-	.last_log_index = 0,
-	.dlen = 0,
-	.data = NULL
-};
-snapshot_t xapp_snapshot = {	// this is returned by this module and can be used safely by the other modules
-	.last_log_index = 0,
+
+/*
+	Stores the last snapshot taken from the xApp
+*/
+xapp_snapshot_t xapp_snapshot = {
+	.last_index = 0,
+	.items = 0,
 	.dlen = 0,
 	.data = NULL
 };
 
-pthread_mutex_t ctx_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t in_progress_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+	Stores the last snapshot taken from the Raft configuration
+*/
+raft_snapshot_t raft_snapshot = {
+	.last_term = 0,
+	.last_index = 0,
+	.items = 0,
+	.dlen = 0,
+	.data = NULL
+};
+
+pthread_mutex_t xapp_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t raft_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t xapp_in_progress_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t raft_in_progress_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 /*
 	Used only for testing purposes
 */
-int *get_in_progress( ) {
-	return &in_progress;
+int *get_xapp_in_progress( ) {
+	return &xapp_in_progress;
 }
 
 /*
 	Used only for testing purposes
 */
-ctx_metabuf_t *get_ctx_metabuf( ) {
-	return &ctx_metabuf;
+int *get_raft_in_progress( ) {
+	return &raft_in_progress;
 }
 
 /*
 	Used only for testing purposes
 */
-snapshot_t *get_ctx_snapshot( ) {
-	return &ctx_snapshot;
+pipe_metabuf_t *get_xapp_metabuf( ) {
+	return &xapp_metabuf;
+}
+
+/*
+	Used only for testing purposes
+*/
+pipe_metabuf_t *get_raft_metabuf( ) {
+	return &raft_metabuf;
+}
+
+/*
+	Used only for testing purposes
+	Note: User serialize_xapp_snapshot to send the snapshot to a backup
+*/
+xapp_snapshot_t *get_xapp_snapshot( ) {
+	return &xapp_snapshot;
 }
 
 /*
@@ -92,38 +134,142 @@ primary_ctx_t *get_primary_ctxs( ) {
 }
 
 /*
-	Returns the last snapshot taken from this xApp, or NULL if no snapshot has been taken yet
+	Used only for testing purposes
+	Note: User serialize_raft_snapshot to send the snapshot to the followers
 */
-snapshot_t *get_xapp_snapshot( ) {
-	snapshot_t *snapshot = NULL;
+raft_snapshot_t *get_raft_snapshot( ) {
+	return &raft_snapshot;
+}
 
-	pthread_mutex_lock( &ctx_snapshot_lock );
+/*
+	Acquires the raft snapshot mutex
+*/
+void lock_raft_snapshot( ) {
+	pthread_mutex_lock( &raft_snapshot_lock );
+}
 
-	if( ctx_snapshot.data != NULL ) {	// checking if a snapshot has been taken
+/*
+	Releases the raft snapshot mutex
+*/
+void unlock_raft_snapshot( ) {
+	pthread_mutex_unlock( &raft_snapshot_lock );
+}
 
-		if( xapp_snapshot.last_log_index != ctx_snapshot.last_log_index ) {
-			/*
-				we deep-copy all snapshot information here to avoid conflicts with other modules, since
-				the returned pointer could be modified in some way by this module, which would invalidate
-				the data used by the other modules. This also avoids invalid memory access
-			*/
-			xapp_snapshot.last_log_index = ctx_snapshot.last_log_index;
-			xapp_snapshot.dlen = ctx_snapshot.dlen;
-			xapp_snapshot.items = ctx_snapshot.items;
-			xapp_snapshot.data = realloc( xapp_snapshot.data, ctx_snapshot.dlen * sizeof(unsigned char) );
-			if( xapp_snapshot.data == NULL ) {
-				logger_fatal( "unable to reallocate memory to get the xapp snapshot (%s)", strerror( errno ) );
+
+/*
+	Returns the last index of the current snapshot
+
+	Assumes the caller owns the raft_snapshot_lock
+*/
+index_t get_raft_snapshot_last_index( ) {
+	return raft_snapshot.last_index;
+}
+
+/*
+	Returns the last term of the current snapshot
+
+	Assumes the caller owns the raft_snapshot_lock
+*/
+term_t get_raft_snapshot_last_term( ) {
+	return raft_snapshot.last_term;
+}
+
+/*
+	Serializes the last snapshot taken from this xApp instance in the RMR message buffer
+
+	Reallocates the RMR's message buffer if needed
+
+	On success, returns the number of bytes of the serialized snapshot. Returns 0 if no snapshot
+	has been taken yet.
+*/
+int serialize_xapp_snapshot( rmr_mbuf_t **msg, server_id_t *server_id ) {
+	int mlen = 0;	// snapshot message length (header + payload)
+	xapp_snapshot_hdr_t *payload;
+
+	pthread_mutex_lock( &xapp_snapshot_lock );
+
+	if( xapp_snapshot.data != NULL ) {	// checking if a snapshot has been taken
+		mlen = (int) ( XAPP_SNAPSHOT_HDR_SIZE + xapp_snapshot.dlen );	// getting required size for the whole message
+		if( mlen < 0 ){
+			logger_fatal( "size overflow of the serialized xapp snapshot" );
+			exit( 1 );
+		}
+		if( rmr_payload_size( *msg ) < mlen ) {
+			*msg = (rmr_mbuf_t *) rmr_realloc_payload( *msg, mlen, 0, 0 );
+			if( *msg == NULL ) {
+				logger_fatal( "unable to reallocate rmr_mbuf payload to send a xapp snapshot (%s)", strerror( errno ) );
 				exit( 1 );
 			}
-			memcpy( xapp_snapshot.data, ctx_snapshot.data, xapp_snapshot.dlen );
-
 		}
-		snapshot = &xapp_snapshot;
+
+		logger_debug( "serializing xapp snapshot message, last_index: %lu, items: %u, payload: %lu bytes",
+				xapp_snapshot.last_index, xapp_snapshot.items, xapp_snapshot.dlen );
+
+		/*
+			We copy all snapshot information directly to the RMR message buffer instead of returning a struct
+			containing the snapshot information. This avoids extra copying instructions to send a snapshot and
+			also prevents invalid memory access in other modules.
+		*/
+		payload = (xapp_snapshot_hdr_t *) (*msg)->payload;
+		payload->last_index = HTONLL( xapp_snapshot.last_index );
+		payload->dlen = HTONLL( xapp_snapshot.dlen );
+		strcpy( payload->server_id, *server_id );
+		payload->items = htonl( xapp_snapshot.items );
+		memcpy( XAPP_SNAPSHOT_PAYLOAD_ADDR( (*msg)->payload ), xapp_snapshot.data, xapp_snapshot.dlen );
 	}
 
-	pthread_mutex_unlock( &ctx_snapshot_lock );
+	pthread_mutex_unlock( &xapp_snapshot_lock );
 
-	return snapshot;
+	return mlen;
+}
+
+/*
+	Serializes the last snapshot taken from the Raft configuration in the RMR message buffer
+
+	Reallocates the RMR's message buffer if needed
+
+	On success, returns the number of bytes of the serialized snapshot. Returns 0 if no snapshot
+	has been taken yet.
+*/
+int serialize_raft_snapshot( rmr_mbuf_t **msg ) {
+	int mlen = 0;	// snapshot message length (header + payload)
+	raft_snapshot_hdr_t *payload;
+
+	pthread_mutex_lock( &raft_snapshot_lock );
+
+	if( raft_snapshot.data != NULL ) {	// checking if a snapshot has been taken
+		mlen = (int) ( RAFT_SNAPSHOT_HDR_SIZE + raft_snapshot.dlen );	// getting required size for the whole message
+		if( mlen < 0 ){
+			logger_fatal( "size overflow of the serialized raft snapshot" );
+			exit( 1 );
+		}
+		if( rmr_payload_size( *msg ) < mlen ) {
+			*msg = (rmr_mbuf_t *) rmr_realloc_payload( *msg, mlen, 0, 0 );
+			if( *msg == NULL ) {
+				logger_fatal( "unable to reallocate rmr_mbuf payload to send a raft snapshot (%s)", strerror( errno ) );
+				exit( 1 );
+			}
+		}
+
+		logger_debug( "serializing raft snapshot message, last_index: %lu, items: %u, payload: %lu bytes",
+				raft_snapshot.last_index, raft_snapshot.items, raft_snapshot.dlen );
+
+		/*
+			We copy all snapshot information directly to the RMR message buffer instead of returning a struct
+			containing the snapshot information. This avoids extra copying instructions to send a snapshot and
+			also prevents invalid memory access in other modules.
+		*/
+		payload = (raft_snapshot_hdr_t *) (*msg)->payload;
+		memcpy( RAFT_SNAPSHOT_PAYLOAD_ADDR( (*msg)->payload ), raft_snapshot.data, raft_snapshot.dlen );
+		payload->dlen = HTONLL( raft_snapshot.dlen );
+		payload->items = htonl( raft_snapshot.items );
+		payload->last_index = HTONLL( raft_snapshot.last_index );
+		payload->last_term = HTONLL( raft_snapshot.last_term );
+	}
+
+	pthread_mutex_unlock( &raft_snapshot_lock );
+
+	return mlen;
 }
 
 /*
@@ -178,31 +324,27 @@ static inline void free_contexts( ) {
 	Returns 0 on error
 
 */
-static inline int write_pipe( int writefd, void *src, size_t len ) {
+int write_pipe( int writefd, void *src, size_t len ) {
 	ssize_t bytes;
 	ssize_t write_bytes = 0;
 	ssize_t chunk;	// chunk of bytes to copy from src to pipe (needs to be with signed)
-	unsigned char *buffer = src;
-	long max_pipe_buf;
-
-	max_pipe_buf = fpathconf( writefd, _PC_PIPE_BUF );
-
+	unsigned char *buffer = (unsigned char *) src;
 	/*
 		we need a loop here since the snapshot data could be greater than the max size a pipe can
 		transport on its internal kernel buffer
 		If we write more than PIPE_BUF in a pipe, there is no guarantee that this write is done
-		atomically
+		atomically if more than one process writes to the same pipe
 	*/
 	do {
 		chunk = len - write_bytes;
-		if( chunk > max_pipe_buf ) {
-			chunk = max_pipe_buf;
+		if( chunk > PIPE_BUF ) {
+			chunk = PIPE_BUF;
 		}
-		bytes = write( writefd, buffer + write_bytes, chunk );
+		bytes = write( writefd, buffer, chunk );
 		logger_debug( "child process wrote to the pipe: %ld bytes", bytes );
 		if( bytes > 0 ) {
 			write_bytes += bytes;
-
+			buffer += bytes;	// incrementing the pointer
 		} else {
 			return 0;
 		}
@@ -224,118 +366,165 @@ static inline int write_pipe( int writefd, void *src, size_t len ) {
 	Returns 0 on error, and the dest pointer remains untouched
 
 */
-static inline int read_pipe( int readfd, void *dest, size_t len ) {
+int read_pipe( int readfd, void *dest, size_t len ) {
 	ssize_t bytes;
 	ssize_t read_bytes = 0;
-	void *buffer;
+	unsigned char *buffer = (unsigned char *) dest;
 	ssize_t chunk;	// chunk of bytes to copy from pipe to buffer (needs to be with signed)
-	long max_pipe_buf;
-
-	buffer = malloc( len );
-	if( buffer == NULL ) {
-		logger_fatal( "unable allocate buffer to read data from the pipe" );
-		exit( 1 );
-	}
-
-	max_pipe_buf = fpathconf( readfd, _PC_PIPE_BUF );
-
 	/*
 		we need a loop here since the snapshot data could be greater than the max size a pipe can
 		transport on its internal kernel buffer
 	*/
 	do {
 		chunk = len - read_bytes;
-		if( chunk > max_pipe_buf ) {
-			chunk = max_pipe_buf;
+		if( chunk > PIPE_BUF ) {
+			chunk = PIPE_BUF;
 		}
-		bytes = read( readfd, buffer + read_bytes, chunk );
+		bytes = read( readfd, buffer, chunk );
 		logger_debug( "parent process read from the pipe: %ld bytes", bytes );
 		if( bytes > 0 ) {
 			read_bytes += bytes;
-
+			buffer += bytes;	// incrementing pointer
 		} else {
-			free( buffer );
 			return 0;
 		}
 	} while( read_bytes < len );
-
-	memcpy( dest, buffer, len );
-	free( buffer );
 
 	return 1;
 }
 
 /*
-	Locks the required mutexes before forking the process to avoid
-	deadlock of the child process
-*/
-static inline void lock_resources( ) {
-	lock_server_log( );
-}
-
-/*
-	Releases all mutexes acquired before forking the process
-*/
-static inline void unlock_resources( ) {
-	unlock_server_log( );
-}
-
-/*
-	This function implements the fork routines of the parent process to take snapshot as a thread,
+	This function implements the xapp fork routines for the parent process to take snapshot as a thread,
 	allowing the parent process to keep processing incoming requests in the meantime
 */
-void *parent_thread( ) {
+void *parent_xapp_thread( ) {
 	int exit_status;			// exit status of the child
 
-	close( ctx_pipe[1] );		// closing write fd
+	close( xapp_pipe[1] );		// closing write fd
 
-	if( read_pipe( ctx_pipe[0], &ctx_metabuf, sizeof(ctx_metabuf_t) ) ) {
+	if( read_pipe( xapp_pipe[0], &xapp_metabuf, sizeof(pipe_metabuf_t) ) ) {
 
-		pthread_mutex_lock( &ctx_snapshot_lock );
+		pthread_mutex_lock( &xapp_snapshot_lock );
 
-		ctx_snapshot.data = realloc( ctx_snapshot.data, ctx_metabuf.dlen * sizeof(unsigned char) );
-		if( ctx_snapshot.data == NULL ) {
+		xapp_snapshot.data = realloc( xapp_snapshot.data, xapp_metabuf.dlen * sizeof(unsigned char) );
+		if( xapp_snapshot.data == NULL ) {
+			logger_fatal( "unable to reallocate memory for the xapp snapshot data (%s)", strerror( errno ) );
+			exit( 1 );
+		}
+
+		if( read_pipe( xapp_pipe[0], xapp_snapshot.data, xapp_metabuf.dlen ) ) {
+			xapp_snapshot.last_index = xapp_metabuf.last_index;
+			xapp_snapshot.dlen = xapp_metabuf.dlen;
+			xapp_snapshot.items = xapp_metabuf.items;
+
+			/*
+				LOG compaction
+				do log compation here, before finalizing the snapshot and changing the xapp_in_progress variable
+				In this way, the other threads won't start a new snapshot while there is another snapshot in progress
+			*/
+			compact_server_log( xapp_snapshot.last_index );
+
+			logger_debug( "===== xapp snapshot ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====",
+					xapp_snapshot.last_index, xapp_snapshot.items, xapp_snapshot.dlen, *(long *) xapp_snapshot.data );
+
+		} else {
+			logger_error( "unable to read the xapp snapshot data from the pipe" );
+		}
+
+		pthread_mutex_unlock( &xapp_snapshot_lock );
+
+	} else {
+		logger_error( "unable to read the xapp snapshot metadata from the pipe" );
+	}
+
+	close( xapp_pipe[0] );		// closing read fd
+
+	pthread_mutex_lock( &xapp_in_progress_lock );
+	xapp_in_progress = 0;		// changing the snapshot status to "not in progress"
+	pthread_mutex_unlock( &xapp_in_progress_lock );
+
+	if( waitpid( xapp_pid, &exit_status, 0 ) >= 0 ) { 		// wait the xapp child
+		if( WIFEXITED( exit_status ) ) {
+			if( WEXITSTATUS( exit_status ) != EXIT_SUCCESS ) {
+				logger_error( "child process of the xapp snapshot exited with code %d", WEXITSTATUS( exit_status ) );
+			} else {	// compiler should drop this else on smaller logger levels
+				logger_debug( "child process of the xapp snapshot exited with code %d", WEXITSTATUS( exit_status ) );
+			}
+
+		} else if( WIFSIGNALED( exit_status ) ) {
+			logger_error( "child process of the xapp snapshot exited abnormally, signal %d", WTERMSIG( exit_status ) );
+		}
+	} else {
+		logger_error( "unable to wait for the xapp snapshotting process (%s)", strerror( errno ) );
+	}
+
+	return NULL;
+}
+
+/*
+	This function implements the raft fork routines for the parent process to take snapshot as a thread,
+	allowing the parent process to keep processing incoming requests in the meantime (while snapshotting)
+*/
+void *parent_raft_thread( ) {
+	int exit_status;			// exit status of the child
+
+	close( raft_pipe[1] );		// closing write fd
+
+	if( read_pipe( raft_pipe[0], &raft_metabuf, sizeof(pipe_metabuf_t) ) ) {
+
+		pthread_mutex_lock( &raft_snapshot_lock );
+
+		raft_snapshot.data = realloc( raft_snapshot.data, raft_metabuf.dlen * sizeof(unsigned char) );
+		if( raft_snapshot.data == NULL ) {
 			logger_fatal( "unable to reallocate memory for the snapshot data (%s)", strerror( errno ) );
 			exit( 1 );
 		}
 
-		if( read_pipe( ctx_pipe[0], ctx_snapshot.data, ctx_metabuf.dlen ) ) {
-			ctx_snapshot.last_log_index = ctx_metabuf.last_log_index;
-			ctx_snapshot.dlen = ctx_metabuf.dlen;
-			ctx_snapshot.items = ctx_metabuf.items;
+		if( read_pipe( raft_pipe[0], raft_snapshot.data, raft_metabuf.dlen ) ) {
+			raft_snapshot.last_term = raft_metabuf.last_term;
+			raft_snapshot.last_index = raft_metabuf.last_index;
+			raft_snapshot.dlen = raft_metabuf.dlen;
+			raft_snapshot.items = raft_metabuf.items;
 
 			/*
 				LOG compaction
-				do log compation here, before finalizing the snapshot and changing the in_progress variable
+				do log compation here, before finalizing the snapshot and changing the raft_in_progress variable
 				In this way, the other threads won't start a new snapshot while there is another snapshot in progress
 			*/
-			compact_server_log( );
+			compact_raft_log( raft_snapshot.last_index );
 
-			logger_debug( "===== snapshot ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_snapshot.last_log_index,
-					ctx_snapshot.items, ctx_snapshot.dlen, *(long *) ctx_snapshot.data );
+			logger_debug( "===== raft snapshot ::::: last_term: %lu, last_index: %lu, items: %u, dlen: %lu ::::: =====",
+					raft_snapshot.last_term, raft_snapshot.last_index, raft_snapshot.items, raft_snapshot.dlen );
 
 		} else {
-			logger_error( "unable to read the snapshot data from the pipe" );
+			logger_error( "unable to read the raft snapshot data from the pipe" );
 		}
 
-		pthread_mutex_unlock( &ctx_snapshot_lock );
+		pthread_mutex_unlock( &raft_snapshot_lock );
 
 	} else {
-		logger_error( "unable to read the snapshot metadata from the pipe" );
+		logger_error( "unable to read the raft snapshot metadata from the pipe" );
 	}
 
-	close( ctx_pipe[0] );		// closing read fd
+	close( raft_pipe[0] );		// closing read fd
 
-	pthread_mutex_lock( &in_progress_lock );
-	in_progress = 0;		// changing the snapshot status to "not in progress"
-	pthread_mutex_unlock( &in_progress_lock );
+	pthread_mutex_lock( &raft_in_progress_lock );
+	raft_in_progress = 0;		// changing the snapshot status to "not in progress"
+	pthread_mutex_unlock( &raft_in_progress_lock );
 
-	if( wait( &exit_status ) > 0 ) { 		// wait any child (only one)
-		if( exit_status != EXIT_SUCCESS ) {
-			logger_error( "snapshot child process returned exit status %d", exit_status >> 8 );
+	if( waitpid( raft_pid, &exit_status, 0 ) >= 0 ) { 		// wait the raft child
+		if( WIFEXITED( exit_status ) ) {
+			if( WEXITSTATUS( exit_status ) != EXIT_SUCCESS ) {
+				logger_error( "child process of the raft snapshot exited with code %d", WEXITSTATUS( exit_status ) );
+			} else {	// compiler should drop this else on smaller logger levels
+				logger_debug( "child process of the raft snapshot exited with code %d", WEXITSTATUS( exit_status ) );
+			}
+
+		} else if( WIFSIGNALED( exit_status ) ) {
+			logger_error( "child process of the raft snapshot exited abnormally, signal %d", WTERMSIG( exit_status ) );
 		}
 	} else {
-		logger_error( "unable to wait for the snapshotting process (%s)", strerror( errno ) );
+		logger_error( "unable to wait for the raft snapshotting process (%s)", strerror( errno ) );
 	}
 
 	return NULL;
@@ -353,11 +542,10 @@ void *parent_thread( ) {
 	If a snapshot is on the way, this function does nothing
 
 	IMPORTANT: This function does not return any data to avoid blocking the caller process.
-	To get the snapshot data use the familily of functions get_***_snapshot( )
+	To send the snapshot data use serialize_xapp_snapshot function which places the snapshot in the RMR message buffer
 */
 void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot_cb ) {
 	int exit_status;			// exit status of the child
-	pid_t pid;
 	unsigned char *data = NULL;	// serialized data
 	pthread_t th_id;
 
@@ -367,51 +555,52 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 		return;
 	}
 
-	pthread_mutex_lock( &in_progress_lock );
+	pthread_mutex_lock( &xapp_in_progress_lock );
 
-	if( !in_progress ) {	// checking if no snapshot is in progress
+	if( !xapp_in_progress ) {	// checking if no snapshot is in progress
 		/*
 			changing the snapshot status to "in progress"
 			this status will be reverted by the parent thread
 		*/
-		in_progress = 1;
+		xapp_in_progress = 1;
 
-		pthread_mutex_unlock( &in_progress_lock );
+		pthread_mutex_unlock( &xapp_in_progress_lock );
 
 	} else {
-		pthread_mutex_unlock( &in_progress_lock );
+		pthread_mutex_unlock( &xapp_in_progress_lock );
 		return;
 	}
 
-	if( pipe( ctx_pipe ) == -1 ) {
-		logger_fatal( "unable to create pipe to take snapshot (%s)", strerror( errno ) );
+	if( pipe( xapp_pipe ) == -1 ) {
+		logger_fatal( "unable to create pipe to take xapp snapshot (%s)", strerror( errno ) );
 		exit( 1 );
 	}
 
-	// no longer needed since the take_xapp_snapshot function is called with the server's log locked
-	// lock_resources( );
+	/*
+		no need to lock resources (mutexes) before forking as
+		the take_xapp_snapshot function is called with the server_log_lock already locked
+	*/
 
-	pid = fork( );			// creating the child process
-	if( pid == -1 ) {
-		logger_fatal( "unable to fork process to take snapshot (%s)", strerror( errno ) );
+	xapp_pid = fork( );			// creating the child process
+	if( xapp_pid == -1 ) {
+		logger_fatal( "unable to fork process to take xapp snapshot (%s)", strerror( errno ) );
 		exit( 1 );
 	}
 
-	if( pid > 0 ) {		// parent process, reads from the pipe
-		// no longer needed since the resources are unlocked by the caller function
-		// unlock_resources( );
+	if( xapp_pid > 0 ) {		// parent process, reads from the pipe
+		// no need to unlock resources since they are unlocked by the caller function
 
-		if( pthread_create( &th_id, NULL, parent_thread, NULL ) != 0 ) {
-			logger_fatal( "unable to create thread in parent process to wait for the snapshot" );
+		if( pthread_create( &th_id, NULL, parent_xapp_thread, NULL ) != 0 ) {
+			logger_fatal( "unable to create thread in parent process to wait for the xapp snapshot" );
 			exit( 1 );
 		}
 
 	} else {		// child process, writes to the pipe
-		unlock_resources( );
+		unlock_server_log( );	// we have to unlock the required mutex resources to avoid dealocks in the child process
 
 		exit_status = EXIT_SUCCESS;
 
-		close( ctx_pipe[0] );	// closing read fd
+		close( xapp_pipe[0] );	// closing read fd
 
 		pctxs.size = 64;
 		pctxs.len = 0;
@@ -422,26 +611,26 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 		}
 		hashtable_foreach_key( ctxtable, primary_ctx_handler );					// iterate over all keys running handler function
 
-		ctx_metabuf.dlen = take_snapshot_cb( pctxs.contexts, pctxs.len, &ctx_metabuf.items, &data );	// calling take snapshot function in the xapp code
+		xapp_metabuf.dlen = take_snapshot_cb( pctxs.contexts, pctxs.len, &xapp_metabuf.items, &data );	// calling take snapshot function in the xapp code
 
-		ctx_metabuf.last_log_index = get_server_last_log_index( );
+		xapp_metabuf.last_index = get_server_last_log_index( );
 
-		logger_debug( "===== child    ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====", ctx_metabuf.last_log_index,
-					ctx_metabuf.items, ctx_metabuf.dlen, *(long *) data );
+		logger_debug( "===== xapp child    ::::: last_log_index: %lu, items: %u, dlen: %lu, data: %ld ::::: =====",
+				xapp_metabuf.last_index, xapp_metabuf.items, xapp_metabuf.dlen, *(long *) data );
 
-		if( write_pipe( ctx_pipe[1], &ctx_metabuf, sizeof(ctx_metabuf_t) ) ) {	// writing snapshot metadata
+		if( write_pipe( xapp_pipe[1], &xapp_metabuf, sizeof(pipe_metabuf_t) ) ) {	// writing snapshot metadata
 
-			if( !write_pipe( ctx_pipe[1], data, ctx_metabuf.dlen) ) {			// writing snapshot data
-				logger_error( "unable write snapshot data to the pipe (%s)", strerror( errno) );
+			if( !write_pipe( xapp_pipe[1], data, xapp_metabuf.dlen) ) {			// writing snapshot data
+				logger_error( "unable to write the xapp snapshot data to the pipe (%s)", strerror( errno) );
 				exit_status = EX_IOERR;
 			}
 
 		} else {
-			logger_error ( "unable to write snapshot metadata to the pipe (%s)", strerror( errno) );
+			logger_error( "unable to write the xapp snapshot metadata to the pipe (%s)", strerror( errno) );
 			exit_status = EX_IOERR;
 		}
 
-		close( ctx_pipe[1] );	// closing write fd
+		close( xapp_pipe[1] );	// closing write fd
 
 		free_contexts( );
 		if( data ) {
@@ -451,4 +640,135 @@ void take_xapp_snapshot( hashtable_t *ctxtable, take_snapshot_cb_t take_snapshot
 		_exit( exit_status );	// terminates the child process
 
 	}
+}
+
+/*
+	Takes snapshot of the raft configuration
+
+	If a snapshot is on the way, this function does nothing
+
+	IMPORTANT: This function does not return any data to avoid blocking the caller process.
+	To get the snapshot data use the family of functions get_***_snapshot( )
+*/
+void take_raft_snapshot( ) {
+	int exit_status;			// exit status of the child
+	unsigned char *data = NULL;	// serialized data
+	pthread_t th_id;
+
+	pthread_mutex_lock( &raft_in_progress_lock );
+
+	if( !raft_in_progress ) {	// checking if no snapshot is in progress
+		/*
+			changing the snapshot status to "in progress"
+			this status will be reverted by the parent thread
+		*/
+		raft_in_progress = 1;
+
+		pthread_mutex_unlock( &raft_in_progress_lock );
+
+	} else {
+		pthread_mutex_unlock( &raft_in_progress_lock );
+		return;
+	}
+
+	if( pipe( raft_pipe ) == -1 ) {
+		logger_fatal( "unable to create pipe to take raft snapshot (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
+	// locking all required resources before forking to avoid deadlocks
+	lock_raft_config( );
+
+	raft_pid = fork( );			// creating the child process
+	if( raft_pid == -1 ) {
+		logger_fatal( "unable to fork process to take raft snapshot (%s)", strerror( errno ) );
+		exit( 1 );
+	}
+
+	if( raft_pid > 0 ) {		// parent process, reads from the pipe
+		// unlocking all acquired resources
+		unlock_raft_config( );
+
+		if( pthread_create( &th_id, NULL, parent_raft_thread, NULL ) != 0 ) {
+			logger_fatal( "unable to create thread in parent process to wait for the raft snapshot" );
+			exit( 1 );
+		}
+
+	} else {		// child process, writes to the pipe
+		// unlocking all acquired resources
+		unlock_raft_config( );
+
+		exit_status = EXIT_SUCCESS;
+
+		close( raft_pipe[0] );	// closing read fd
+
+		create_raft_config_snapshot( &data, &raft_metabuf );
+
+		logger_debug( "===== raft child    ::::: last_term: %lu, last_index: %lu, items: %u, dlen: %lu ::::: =====",
+				raft_metabuf.last_term, raft_metabuf.last_index, raft_metabuf.items, raft_metabuf.dlen );
+
+		if( write_pipe( raft_pipe[1], &raft_metabuf, sizeof(pipe_metabuf_t) ) ) {	// writing snapshot metadata
+
+			if( !write_pipe( raft_pipe[1], data, raft_metabuf.dlen) ) {				// writing snapshot data
+				logger_error( "unable to write raft snapshot data to the pipe (%s)", strerror( errno) );
+				exit_status = EX_IOERR;
+			}
+
+		} else {
+			logger_error( "unable to write raft snapshot metadata to the pipe (%s)", strerror( errno) );
+			exit_status = EX_IOERR;
+		}
+
+		close( raft_pipe[1] );	// closing write fd
+
+		if( data ) {
+			free( data );
+		}
+
+		_exit( exit_status );	// terminates the child process
+
+	}
+}
+
+int install_raft_snapshot( raft_snapshot_t *snapshot ) {
+	int success = 0;
+	raft_snapshot_t *local;
+	raft_snapshot_t *incoming;
+
+	assert( snapshot != NULL );
+
+	pthread_mutex_lock( &raft_in_progress_lock );
+	if( !raft_in_progress ) {
+		raft_in_progress = 1;
+		pthread_mutex_unlock( &raft_in_progress_lock );
+
+		local = &raft_snapshot;
+		incoming = snapshot;
+
+		// we can compare last_term and last_index directly since both are in network byte order
+		if( ( incoming->last_term != local->last_term ) || ( incoming->last_index != local->last_index ) ) {
+			commit_raft_config_snapshot( snapshot );
+
+			// deep copy from the incoming snapshot to the local one
+			raft_snapshot.last_term = snapshot->last_term;
+			raft_snapshot.last_index = snapshot->last_index;
+			raft_snapshot.items = snapshot->items;
+			raft_snapshot.dlen = snapshot->dlen;
+			raft_snapshot.data = realloc( raft_snapshot.data, snapshot->dlen );
+			if( raft_snapshot.data == NULL ) {
+				logger_fatal( "unable to reallocate buffer to store the incoming raft snapshot data" );
+				exit( 1 );
+			}
+			memcpy( raft_snapshot.data, snapshot->data, raft_snapshot.dlen );
+
+			success = 1;
+		}
+
+		pthread_mutex_lock( &raft_in_progress_lock );
+		raft_in_progress = 0;
+	}
+
+	pthread_mutex_unlock( &raft_in_progress_lock );
+
+	return success;
 }

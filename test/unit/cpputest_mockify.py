@@ -42,18 +42,18 @@ HEADER = """
 #include "CppUTestExt/MockSupport.h"
 
 extern "C" {{
-#include "{input_file}"
-{include_files}
+    #include "{input_file}"
+    {include_files}
 }}\n\n""".lstrip()
 
 VOID_MOCK = """
 {signature} {{
-  mock().actualCall(__func__){with_parameters};
+    mock().actualCall(__func__){with_parameters};
 }}""".lstrip()
 
 NON_VOID_MOCK = """
 {signature} {{
-  return {return_type}mock().actualCall(__func__){with_parameters}
+    return {return_type}mock().actualCall(__func__){with_parameters}
     .{return_value};
 }}""".lstrip()
 

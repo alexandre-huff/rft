@@ -27,12 +27,17 @@
 */
 
 #include "CppUTest/TestHarness.h"
+#include "CppUTestExt/MockSupport.h"
 
 extern "C" {
 	#include "utils.h"
 	#include "stubs/stub_rft.h"
 	#include "stubs/stub_logger.h"
-	#include "stubs/stub_utils.h"
+}
+
+extern int rand( ) {
+    return mock().actualCall(__func__)
+		.returnIntValueOrDefault( 0 );
 }
 
 TEST_GROUP( TestUtils ) {
@@ -41,7 +46,7 @@ TEST_GROUP( TestUtils ) {
 	}
 
 	void teardown() {
-
+		mock().clear();
 	}
 };
 
@@ -117,8 +122,13 @@ TEST( TestUtils, TimespecAddMilliseconds ) {
 }
 
 TEST( TestUtils, RandomizeElectionTimeout ) {
-	int t;
-	t = randomize_election_timeout( );
+	mock()
+		.expectOneCall( "rand" )
+		.andReturnValue( 0 );
+
+	int t = randomize_election_timeout( );
+	mock().checkExpectations();
+
 	/*
 		should return ELECTION_TIMEOUT with rand returning 0 in stub_utils.h
 		t = ELECTION_TIMEOUT + rand() % (ELECTION_TIMEOUT + 1);

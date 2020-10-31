@@ -108,18 +108,17 @@ typedef struct raft_log_entry_hdr {
 
 /*
 	Defines a server log entry header to transport xApp's commands for the state machine
-	Note: on adding or removing fields, check SERVER_LOG_ENTRY_HDR_SIZE and its related macros, and serialize/deserialize functions
+	Note: on adding or removing fields, check XAPP_LOG_ENTRY_HDR_SIZE and its related macros, and serialize/deserialize functions
 	DANGER:	keep this struct aligned to avoid serialize/deserialize wrong information,
 			care must be taken when adding, removing, or moving a field from its position
 */
-typedef struct server_log_entry_hdr {
+typedef struct xapp_log_entry_hdr {
 	index_t index;				// index of log entry (populated be the append log entries according to its position in the log)
 	size_t dlen;				// length of the data in bytes
 	unsigned int clen;			// length of the context in bytes
 	unsigned int klen;			// lengh of the key in bytes
 	int command;				// command for state machine (user defined)
-	// int padding4bytes;		// check if required - not used, just for struct misalignment (aligned by 8 bytes)
-} server_log_entry_hdr_t;
+} xapp_log_entry_hdr_t;
 
 /*
 	Defines the header's size of a server log entry (xApp replication)
@@ -127,37 +126,59 @@ typedef struct server_log_entry_hdr {
 
 	Payload is organized as: CONTEXT | KEY | CMD_DATA	where CMD_DATA is the value of the key for that command
 */
-#define SERVER_LOG_ENTRY_HDR_SIZE ( sizeof(server_log_entry_hdr_t) )	// Check if padding is required when using sizeof of the whole struct
-// #define SERVER_LOG_ENTRY_HDR_SIZE ( sizeof(index_t) + sizeof(size_t) + sizeof(unsigned int) + sizeof(unsigned int) + sizeof(int) ) // without padding
-#define SERVER_CTX_PAYLOAD_LEN(hdr) ( ntohl(((server_log_entry_hdr_t *)hdr)->clen) )
-#define SERVER_KEY_PAYLOAD_LEN(hdr) ( ntohl((( server_log_entry_hdr_t *)hdr)->klen) )
-#define SERVER_DATA_PAYLOAD_LEN(hdr) ( NTOHLL(((server_log_entry_hdr_t *)hdr)->dlen) )
-#define SERVER_CTX_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SERVER_LOG_ENTRY_HDR_SIZE )
-#define SERVER_KEY_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SERVER_LOG_ENTRY_HDR_SIZE + SERVER_CTX_PAYLOAD_LEN(hdr) )
-#define SERVER_DATA_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SERVER_LOG_ENTRY_HDR_SIZE + SERVER_CTX_PAYLOAD_LEN(hdr) + SERVER_KEY_PAYLOAD_LEN(hdr) )
+#define XAPP_LOG_ENTRY_HDR_SIZE ( sizeof(xapp_log_entry_hdr_t) )	// Check if padding is required when using sizeof of the whole struct
+// #define XAPP_LOG_ENTRY_HDR_SIZE ( sizeof(index_t) + sizeof(size_t) + sizeof(unsigned int) + sizeof(unsigned int) + sizeof(int) ) // without padding
+#define XAPP_CTX_PAYLOAD_LEN(hdr) ( ntohl(((xapp_log_entry_hdr_t *)hdr)->clen) )
+#define XAPP_KEY_PAYLOAD_LEN(hdr) ( ntohl((( xapp_log_entry_hdr_t *)hdr)->klen) )
+#define XAPP_DATA_PAYLOAD_LEN(hdr) ( NTOHLL(((xapp_log_entry_hdr_t *)hdr)->dlen) )
+#define XAPP_CTX_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + XAPP_LOG_ENTRY_HDR_SIZE )
+#define XAPP_KEY_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + XAPP_LOG_ENTRY_HDR_SIZE + XAPP_CTX_PAYLOAD_LEN(hdr) )
+#define XAPP_DATA_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + XAPP_LOG_ENTRY_HDR_SIZE + XAPP_CTX_PAYLOAD_LEN(hdr) + XAPP_KEY_PAYLOAD_LEN(hdr) )
 
 /*
-	Defines a header to transport snapshots
-	Note: on adding or removing fields, check SNAPSHOT_REQ_HDR_SIZE and its related macros, and serialize/deserialize functions
+	Defines the header to transport server (xapp) snapshots
+	Note: on adding or removing fields, check XAPP_SNAPSHOT_HDR_SIZE and its related macros, and serialize/deserialize functions
 	DANGER:	keep this struct aligned to avoid serialize/deserialize wrong information,
 			care must be taken when adding, removing, or moving a field from its position
 */
-typedef struct req_snapshot_hdr {
-	index_t last_log_index;		// index of the snapshot's last log entry
+typedef struct xapp_snapshot_hdr {
+	index_t last_index;			// index of the snapshot's last log entry
 	size_t dlen;				// length of the snapshot data
-	snapshot_type_e type;		// defines of the snapshot is of type either raft or server
-	unsigned int items;			// number of context/key/value group items
 	server_id_t server_id;
-} req_snapshot_hdr_t;
+	unsigned int items;
+} xapp_snapshot_hdr_t;
 
 /*
-	Defines the header size of a snapshot message
+	Defines the header size of an xapp snapshot message
 */
-#define SNAPSHOT_REQ_HDR_SIZE ( sizeof(req_snapshot_hdr_t) )
-#define SNAPSHOT_REQ_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + SNAPSHOT_REQ_HDR_SIZE )
+#define XAPP_SNAPSHOT_HDR_SIZE ( sizeof(xapp_snapshot_hdr_t) )
+#define XAPP_SNAPSHOT_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + XAPP_SNAPSHOT_HDR_SIZE )
+
+/*
+	Defines the header to transport raft configuration snapshots
+	Note: on adding or removing fields, check RAFT_SNAPSHOT_HDR_SIZE and its related macros, and serialize/deserialize functions
+	DANGER:	keep this struct aligned to avoid serialize/deserialize wrong information,
+			care must be taken when adding, removing, or moving a field from its position
+*/
+typedef struct raft_snapshot_hdr {
+	term_t term;			// current term of the leader that is sending the snapshot
+	index_t last_index;		// index of the snapshot's last log entry
+	term_t last_term;		// term of the snapshot's last log entry
+	size_t dlen;			// length of the snapshot data
+	server_id_t leader_id;
+	unsigned int items;
+} raft_snapshot_hdr_t;
+
+/*
+	Defines the header size of a raft snapshot message
+*/
+#define RAFT_SNAPSHOT_HDR_SIZE ( sizeof(raft_snapshot_hdr_t) )
+#define RAFT_SNAPSHOT_PAYLOAD_ADDR(hdr) ( (unsigned char *)hdr + RAFT_SNAPSHOT_HDR_SIZE )
+
 
 void appnd_entr_header_to_msg_cpy( appnd_entr_hdr_t *header, request_append_entries_t *msg );
 void repl_req_header_to_msg_cpy( repl_req_hdr_t *header, replication_request_t *msg );
-void server_snapshot_header_to_msg_cpy( req_snapshot_hdr_t *header, snapshot_request_t *msg );
+void xapp_snapshot_header_to_msg_cpy( xapp_snapshot_hdr_t *header, xapp_snapshot_request_t *msg );
+void raft_snapshot_header_to_msg_cpy( raft_snapshot_hdr_t *header, raft_snapshot_request_t *msg );
 
 #endif

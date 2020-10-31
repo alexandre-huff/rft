@@ -80,13 +80,31 @@ void repl_req_header_to_msg_cpy( repl_req_hdr_t *header, replication_request_t *
 
 	memcpy cannot be used since of possible unaligned data
 */
-void server_snapshot_header_to_msg_cpy( req_snapshot_hdr_t *header, snapshot_request_t *msg ) {
+void xapp_snapshot_header_to_msg_cpy( xapp_snapshot_hdr_t *header, xapp_snapshot_request_t *msg ) {
 	assert( header != NULL );
 	assert( msg != NULL );
 
-	msg->type = ntohl( header->type );
-	msg->snapshot.last_log_index = NTOHLL( header->last_log_index );
+	msg->snapshot.last_index = NTOHLL( header->last_index );
 	msg->snapshot.dlen = NTOHLL( header->dlen );
 	msg->snapshot.items = ntohl( header->items );
 	strcpy( msg->server_id, header->server_id );
+}
+
+/*
+	Copies network header data from a raft snapshot request to a snapshot request message
+
+	It is the caller responsibility to allocate and freeing both pointers
+
+	memcpy cannot be used since of possible unaligned data
+*/
+void raft_snapshot_header_to_msg_cpy( raft_snapshot_hdr_t *header, raft_snapshot_request_t *msg ) {
+	assert( header != NULL );
+	assert( msg != NULL );
+
+	msg->term = NTOHLL( header->term );	// current leader term
+	msg->snapshot.last_term = NTOHLL( header->last_term );	// last snapshot term
+	msg->snapshot.last_index = NTOHLL( header->last_index );
+	msg->snapshot.dlen = NTOHLL( header->dlen );
+	msg->snapshot.items = ntohl( header->items );
+	strcpy( msg->leader_id, header->leader_id );
 }

@@ -23,7 +23,7 @@
 
 CC = gcc
 
-CFLAGS = -g -Wall -O3 -I$(INCLUDEDIR)
+CFLAGS = -g -Wall -O3 -I$(INCLUDEDIR) -DLOGGER_LEVEL=LOGGER_INFO
 LDFLAGS = -lrmr_si -lpthread -lm
 
 # DEPFLAGS = -MMD -MP -MT $@ -MF $(DEPDIR)/$*.d
