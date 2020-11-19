@@ -27,8 +27,8 @@
 	Author:		Alexandre Huff
 */
 
-#ifndef RFT_MTL_H
-#define RFT_MTL_H
+#ifndef _RFT_MTL_H
+#define _RFT_MTL_H
 
 #include <inttypes.h>
 #include <arpa/inet.h>

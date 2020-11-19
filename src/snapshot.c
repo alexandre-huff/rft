@@ -278,27 +278,31 @@ int serialize_raft_snapshot( rmr_mbuf_t **msg ) {
 	If it is, then it is added to the contexts to be snapshotted
 */
 void primary_ctx_handler( hashtable_t *table, const char *key ) {
-	int is_primary;
+	void *ptr;
+	long is_primary;
 
-	is_primary = *(int *) hashtable_get( table, key );
-	if( is_primary ) {
+	ptr = hashtable_get( table, key );
 
-		if( pctxs.size == pctxs.len ) {	// check if it has enough room
-			pctxs.size *= 2;			// double the size
-			pctxs.contexts = (char **) realloc( pctxs.contexts, pctxs.size * sizeof(char *) );
-			if( pctxs.contexts == NULL ) {
-				logger_fatal( "unable to reallocate memory to store contexts for snapshotting (%s)", strerror( errno ) );
+	if( ptr ) {
+		is_primary = (long)(long *) ptr;
+		if( is_primary == RFT_PRIMARY ) {
+			if( pctxs.size == pctxs.len ) {	// check if it has enough room
+				pctxs.size *= 2;			// double the size
+				pctxs.contexts = (char **) realloc( pctxs.contexts, pctxs.size * sizeof(char *) );
+				if( pctxs.contexts == NULL ) {
+					logger_fatal( "unable to reallocate memory to store contexts for snapshotting (%s)", strerror( errno ) );
+					exit( 1 );
+				}
+			}
+
+			pctxs.contexts[pctxs.len] = strdup( key );
+			if( pctxs.contexts[pctxs.len] == NULL ) {
+				logger_fatal( "unable to duplicate the context key to take snapshot (%s)", strerror( errno ) );
 				exit( 1 );
 			}
-		}
 
-		pctxs.contexts[pctxs.len] = strdup( key );
-		if( pctxs.contexts[pctxs.len] == NULL ) {
-			logger_fatal( "unable to duplicate the context key to take snapshot (%s)", strerror( errno ) );
-			exit( 1 );
+			pctxs.len++;
 		}
-
-		pctxs.len++;
 	}
 }
 

@@ -60,10 +60,6 @@ void become_follower( );
 void become_leader( );
 void raft_commit_log_entries( index_t new_commit_index );
 
-/* ############ Global constants ############ */
-static const int primary_replica = 1;	// used by the context hashtable to store the xApp's role
-// static const int backup_replica = 0;	// used by the context hashtable to store the xApp's role
-
 
 /* ############ Global variables ############ */
 
@@ -118,6 +114,7 @@ static replicas_t replica_servers = {	// set of servers that will be used to rep
 };
 
 static hashtable_t *ctxtab = NULL;	// hastable used to store if this xApp instance is the Primary or the Backup of a context
+static hashtable_t *roletab = NULL;	// hastable used to store if this xApp replica is the Primary or the Backup of a given meid
 
 /*
 	stores the maximum msg size (in bytes) that RMR is able to receive
@@ -383,9 +380,15 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		exit( 1 );
 	}
 
-	ctxtab = hashtable_new( STRING_KEY, 127 );
+	ctxtab = hashtable_new( STRING_KEY, 503 );
 	if( ctxtab == NULL ) {
 		logger_fatal( "unable to initialize the context hashtable" );
+		exit( 1 );
+	}
+
+	roletab = hashtable_new( STRING_KEY, 503 );
+	if( roletab == NULL ) {
+		logger_fatal( "unable to initialize the role awareness hashtable" );
 		exit( 1 );
 	}
 
@@ -442,7 +445,8 @@ int rft_enqueue_msg( rmr_mbuf_t *msg ) {
 		- EINVAL: invalid argument
 		- ENOTCONN: There is no server to replicate that command. Also, no log entry is created.
 */
-int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len ) {
+int rft_replicate( int command, const char *context, const char *key, unsigned char *value,
+					size_t len, unsigned char *meid, role_e role ) {
 	log_entry_t *entry = NULL;
 
 	if( context == NULL || key == NULL || value == NULL ) {
@@ -451,16 +455,17 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 		return 0;
 	}
 
-	if( raft_get_num_servers( ) == 1 ) {
-		errno = ENOTCONN;
-		return 0;
-	}
-
 	entry = new_server_log_entry( context, key, command, value, len );
 
 	// TODO Future: will be changed, most likely when raft configuration changes
-	if( hashtable_get( ctxtab, context ) == NULL ) {	// we assume that if this replica receives the first message, then it is the primary
-		if( ! hashtable_insert( ctxtab, context, (void *) &primary_replica ) ) {
+	if( role != RFT_PRIMARY ) {
+		if( ! hashtable_insert( roletab, (const char *) meid, (void *) RFT_PRIMARY ) ) {
+			logger_error( "unable to insert primary meid %s in roletable as primary replica", meid );
+			return 0;
+		}
+
+		// TODO we assume that if this replica receives the first message, then it is the primary
+		if( ! hashtable_insert( ctxtab, context, (void *) RFT_PRIMARY ) ) {
 			logger_error( "unable to insert context %s in ctxtable as primary replica", context );
 			return 0;
 		}
@@ -468,7 +473,23 @@ int rft_replicate( int command, const char *context, const char *key, unsigned c
 
 	append_server_log_entry( entry, ctxtab, take_xapp_snapshot_cb );
 
+	/*
+		The local state needs to be changed after append the command in the log.
+		When a snapshot is taken the primary contexts would already have been modified, and the
+		"same local" command would be applied twice in the backup replicas,
+		leading to inconsistent states among different replicas
+	*/
+	// calling registered callback
+	apply_command_cb( command, context, key, value, len );
+
 	return 1;
+}
+
+/*
+	Returns the role of this xApp replica for a given Managed Equipment
+*/
+role_e get_role( unsigned char *meid ) {
+	return (role_e) hashtable_get( roletab, (const char *) meid );
 }
 
 /*
@@ -1716,6 +1737,12 @@ void handle_replication_request( replication_request_t *request, replication_rep
 				logger_debug( "applying  xapp state  replication for server %s", request->server_id );
 
 				for( i = 0; i < request->n_entries; i++, server->replica_index++ ) {
+					// TODO we are assuming for experiment purposes that the context is the the meid
+					hashtable_insert( roletab, request->entries[i]->context, (void *) RFT_BACKUP );
+
+					// TODO we are assuming if this replica receives a replication request, then it is a backup
+					hashtable_insert( ctxtab, request->entries[i]->context, (void *) RFT_BACKUP );
+
 					// calling registered callback
 					apply_command_cb( request->entries[i]->command, request->entries[i]->context, request->entries[i]->key,
 										request->entries[i]->data, request->entries[i]->dlen );

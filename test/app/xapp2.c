@@ -40,6 +40,7 @@
 
 #include "rft.h"
 #include "logger.h"
+#include "../../src/static/hashtable.c"
 
 #include "app.h"
 
@@ -82,85 +83,159 @@ long	errors = 0;
 long	sfailed = 0;
 /* ===== stats variables up to here ===== */
 
-long pri_state = 0;			// state maintained by this xapp (primary)
-long bkp_state = 0;			// state replicated from another xapp (backup)
-
-pthread_mutex_t pri_lock = PTHREAD_MUTEX_INITIALIZER;	// primary state lock
-pthread_mutex_t bkp_lock = PTHREAD_MUTEX_INITIALIZER;	// backup state lock
 const long ivalue = 1;		// increment value
+pthread_mutex_t fsm_lock = PTHREAD_MUTEX_INITIALIZER;	// state machine lock
+static hashtable_t *ctx_table = NULL;
 
 // function that will be called by the rft library
-void apply_rstate( const int cmd, const char *context, const char *key, const unsigned char *data, const size_t dlen ) {
+void apply_state( const int cmd, const char *context, const char *key, const unsigned char *data, const size_t dlen ) {
+	void *ptr;
+	long *ctx_data;
+
+	LOCK( &fsm_lock );
+
+	ptr = hashtable_get( ctx_table, context );
+	if( ptr ) {
+		ctx_data = (long *) ptr;
+
+	} else {
+		ctx_data = (long *) malloc( sizeof(long) );
+		*ctx_data = 0;
+		if( ! hashtable_insert( ctx_table, context, (void *) ctx_data ) ) {
+			fprintf( stderr, "unable to store initial state for context %s\n", context );
+			exit( 1 );
+		}
+	}
 
 	switch ( cmd ) {
 		case SET_RSTATE:
-			pthread_mutex_lock( &bkp_lock );
-			bkp_state = (long) *data;
-			pthread_mutex_unlock( &bkp_lock );
+			*ctx_data = (long) *data;
 			break;
 
 		case ADD_RSTATE:
-			pthread_mutex_lock( &bkp_lock );
-			bkp_state += (long) *data;
-			pthread_mutex_unlock( &bkp_lock );
+			*ctx_data += (long) *data;
 			break;
 
 		case SUB_RSTATE:
-			pthread_mutex_lock( &bkp_lock );
-			bkp_state -= (long) *data;
-			pthread_mutex_unlock( &bkp_lock );
+			ctx_data -= (long) *data;
 			break;
 
 		default:
 			logger_warn( "unrecognized FSM command" );
 	}
 
-	// logger_warn( "replica's xapp state changed to %d, context: %s, key: %s", bkp_state, context, key );
+	// logger_warn( "state changed to %ld, context: %s, key: %s", *ctx_data, context, key );
+
+	UNLOCK( &fsm_lock );
 }
 
 // function called by the rft library
 size_t take_snapshot( char **contexts, int nctx, unsigned int *items, unsigned char **data ) {
-	// an example of iterating over contexts
-	/* int i;
+	/* an example of iterating over contexts
+	int i;
 	for( i = 0; i < nctx; i++ ) {
 		hashtable_get( table, contexts[i] )
 		// it could be: clen|context|klen|key|vlen|value|clen|context|klen|key|vlen|value...
 		memcpy( data, &state, size );
 		// each item corresponds to: clen|context|klen|key|vlen|value
 	} */
+	void *ctx_data;
+	size_t size = 1024;	// we start the snapshot with size of 1K
+	size_t offset = 0;
+	int i;
+	int clen;
+	int vlen;
 
-	*data = realloc( *data, sizeof(long) );
+	*data = realloc( *data, size );
 	if( *data == NULL ) {
 		logger_fatal( "unable to reallocate data while taking snapshot" );
 		exit( 1 );	// this will only exit the child process
 	}
 
-	*items = 1;
+	for( i = 0; i < nctx; i++ ) {
+		clen = strlen( contexts[i] );
+		vlen = sizeof(long);	// size of our context data
+		ctx_data = hashtable_get( ctx_table, contexts[i] );
 
-	memcpy( *data, &pri_state, sizeof(long) );
+		// ckecking if the snapshot data needs to resized
+		if( ( offset + clen + vlen + sizeof(int)*2 ) > size ) {
+			*data = realloc( *data, size );
+			if( *data == NULL ) {
+				logger_fatal( "unable to reallocate/resize data while taking snapshot" );
+				exit( 1 );	// this will only exit the child process
+			}
+		}
 
-	return sizeof(long);	// size of the snapshot data
+		memcpy( *data+offset, &clen, sizeof(int) );
+		offset += sizeof(int);
+		memcpy( *data+offset, contexts[i], clen );
+		offset += clen;
+
+		memcpy( *data+offset, &vlen, sizeof(int) );
+		offset += sizeof(int);
+		memcpy( *data+offset, ctx_data, vlen );
+		offset += vlen;
+	}
+
+	*items = i;
+
+	return offset;	// size of the snapshot data
 }
 
 void install_snapshot( unsigned int items, const unsigned char *data ) {
-	// an example of iterating over contexts
-	/* int i;
+	/* an example of iterating over contexts
+	int i;
 	for( i = 0; i < items; i++ ) {
 		// it could be: clen|context|klen|key|vlen|value|clen|context|klen|key|vlen|value...
 		memcpy( &value, &state, vlen );
 		// might involve use of hashtable to get the context and its corresponding keys
 	} */
-	pthread_mutex_lock( &bkp_lock );
+	int i;
+	size_t offset = 0;
+	int clen;
+	int vlen;
+	char context[256];
+	void *ptr;
+	long *ctx_data;
 
-	memcpy( &bkp_state, data, sizeof(long) );
-	logger_warn( "snapshot installed, items: %u, bkp_state: %ld", items, bkp_state );
+	// we need to lock the whole state machine while installing a snapshot
+	LOCK( &fsm_lock );
+	for( i = 0; i < items; i++ ) {
+		memcpy( &clen, data+offset, sizeof(int) );
+		offset += sizeof(int);
+		memcpy( context, data+offset, clen );
+		context[clen] = '\0';
+		offset += clen;
 
-	pthread_mutex_unlock( &bkp_lock );
+		ptr = hashtable_delete( ctx_table, context );
+		if( ptr )
+			free( ptr );
+
+		ctx_data = (long *) malloc( sizeof(long) );
+		if( ! ctx_data ) {
+			fprintf( stderr, "unable to allocate memory to install snapshot\n");
+			exit( 1 );
+		}
+
+		memcpy( &vlen, data+offset, sizeof(int) );
+		offset += sizeof(int);
+		memcpy( ctx_data, data+offset, vlen );
+		offset += vlen;
+
+		if( ! hashtable_insert( ctx_table, context, (void *) ctx_data ) ) {
+			fprintf( stderr, "unable to store snapshot state for context %s\n", context );
+			exit( 1 );
+		}
+		logger_warn( "snapshot installed, context: %s, ctx_data: %ld", context, *ctx_data );
+	}
+	UNLOCK( &fsm_lock );
 }
 
 void *listener( void *mrc ) {
 	rmr_mbuf_t	*msg = NULL;
 	int			rts_count;
+	role_e		role;
+	unsigned char meid[RMR_MAX_MEID];
 
 	#if LOGGER_LEVEL >= LOGGER_ERROR
 		mpl_t		*payload;
@@ -202,26 +277,17 @@ void *listener( void *mrc ) {
 						payload = (mpl_t *) msg->payload;
 					#endif
 
-					/*
-						On multi-threaded xApps, all primary contexts should to be locked before the last change of the
-						same thread that is going to replicate that change.
-						The lock can be released right after the replicate function returns to the xApp code.
-						This is required since all primary contexts need to be preserved up to the fork system call returns,
-						and we have a copy of the whole process' memory.
-						If the lock is not acquired, than the state may get inconsistent among the replicas and the master server.
-						IMPORTANT: this lock is not required if you are implementing xapps using the approximate state approach
-					*/
-					pthread_mutex_lock( &pri_lock );
 					#ifndef NORFT
-						rft_replicate( ADD_RSTATE, "UE_RAN_Element", "UE_Counter", (unsigned char *) &ivalue, sizeof(long) );
+						if( rmr_get_meid( msg, meid ) == NULL ){
+							logger_fatal( "unable to get meid from the message" );
+							exit( 1 );
+						}
+						role = get_role( meid );
+						if( role != RFT_BACKUP ) {
+							// using meid as the context in this test example
+							rft_replicate( ADD_RSTATE, (char *)meid , "UE_Counter", (unsigned char *) &ivalue, sizeof(long), meid, role );
+						}
 					#endif
-					/*
-						The local state needs to come after rft_replicate, as when a snapshot is taken the local state (pri_state)
-						would already be modified, and the "same local" command would be applied twice in the backup replicas, thus
-						leading to inconsistent states among different replicas
-					*/
-					pri_state++;
-					pthread_mutex_unlock( &pri_lock );
 
 					msg = rmr_rts_msg( mrc, msg );
 					rts_count = rts_retries;
@@ -376,8 +442,10 @@ int main( int argc, char **argv ) {
 		}
 	}
 
+	ctx_table = hashtable_new( STRING_KEY, 503 );
+
 	#ifndef NORFT
-	rft_init( mrc, listen_port, MAX_RCV_BYTES, apply_rstate, take_snapshot, install_snapshot );
+	rft_init( mrc, listen_port, MAX_RCV_BYTES, apply_state, take_snapshot, install_snapshot );
 	#endif
 
 	/* ===== Creating threads ===== */

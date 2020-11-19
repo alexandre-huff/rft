@@ -45,6 +45,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <math.h>
+#include <limits.h>
 
 #include <rmr/rmr.h>
 
@@ -127,6 +128,7 @@ int main( int argc, char** argv ) {
 	mpl_t		*payload;					// the payload in a message
 	int			nready;						// number of events ready to receive
 	struct 		timespec nanots = {0, 0 };	// timespec for nanosleep
+	char 		hostname[HOST_NAME_MAX + 1];	// meid of this sender
 
 	float		running_time;
 	float		rate_sec;
@@ -271,6 +273,12 @@ int main( int argc, char** argv ) {
 	if( rmr_set_stimeout( mrc, max_retries ) != RMR_OK )
 		fprintf ( stderr, "[WARN] unable to set rmr max retries\n");
 
+	if( gethostname( hostname, RMR_MAX_MEID - 1 ) != 0 ) {
+		fprintf ( stderr, "[FAIL] unable to get hostname to set meid\n");
+		exit( 1 );
+	}
+	fprintf ( stderr, "meid: %s\n", hostname );
+
 	fprintf( stderr, "[INFO] sending messages...\n" );
 
 	/***************** SENDER *****************/
@@ -299,6 +307,10 @@ int main( int argc, char** argv ) {
 		sbuf->sub_id = -1;
 		sbuf->len =	sizeof( *payload ) ;
 		sbuf->state = 0;
+		if( rmr_str2meid( sbuf, (unsigned char *) hostname ) != RMR_OK ) {
+			fprintf( stderr, "[FAIL] unable to set meid in the message\n" );
+			exit( 1 );
+		}
 
 		sbuf = rmr_send_msg( mrc, sbuf );
 		switch( sbuf->state ) {

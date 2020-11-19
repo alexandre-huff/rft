@@ -68,6 +68,8 @@ The RFT provides a clean and lightweight, but powerful API to the developers tha
 
 * rft_enqueue_msg( msg ) - pass a message to the RFT library. A set of messages are reserved to the RFT and xApp only needs to forward that messages to the RFT by using this function
 
+* get_role( meid ) - returns the role that the current xApp replica is playing for the corresponding Managed Equipment. This operation allows the xApp replica to learn its role and to process the message accordingly
+
 * rft_replicate( command, context, key, value, len ) - operation called by the xApp to replicate its state passing the following arguments:
 
     * command: the command (int) which will be executed by the state machine

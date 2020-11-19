@@ -129,6 +129,8 @@ int main( int argc, char **argv ) {
 	int			rts_retries = 0;		// max loop retries for rmr_rts_msg
 	int			rts_count;
 	char		wbuf[8];
+	role_e		role;
+	unsigned char meid[RMR_MAX_MEID];
 
 	#if LOGGER_LEVEL >= LOGGER_WARN
 		unsigned char target[RMR_MAX_SRC];
@@ -248,7 +250,9 @@ int main( int argc, char **argv ) {
 					pri_state += ivalue;
 
 					#ifndef NORFT
-					rft_replicate( ADD_RSTATE, "REL1", "counter", (unsigned char *) &ivalue, sizeof(long) );
+					rmr_get_meid( msg, meid );
+					role = get_role( meid );
+					rft_replicate( ADD_RSTATE, "REL1", "counter", (unsigned char *) &ivalue, sizeof(long), meid, role );
 					#endif
 
 					msg = rmr_rts_msg( mrc, msg );

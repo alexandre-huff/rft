@@ -78,7 +78,16 @@
 	Basically, it defines the maximum size a log can grow up to create a new snapshot
 	This constant is used for both, RAFT and xApp log entries
 */
-#define LOG_SIZE_THRESHOLD			10
+#define LOG_SIZE_THRESHOLD		10
+
+/*
+	Defines the role that an xApp replica plays for a given Managed Equipment
+*/
+typedef enum role {
+	RFT_NONE = 0,
+	RFT_PRIMARY,
+	RFT_BACKUP
+} role_e;
 
 /* FSM apply callback function that xApps must implement */
 typedef void (*apply_state_cb_t)(const int command, const char *context, const char *key, const unsigned char *value, const size_t len);
@@ -99,6 +108,7 @@ typedef void (*install_snapshot_cb_t)( unsigned int items, const unsigned char *
 extern void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb,
 								take_snapshot_cb_t take_snapshot_cb, install_snapshot_cb_t install_snapshot_cb );
 extern int rft_enqueue_msg( rmr_mbuf_t *msg );
-extern int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len );
+extern int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len, unsigned char *meid, role_e role );
+extern role_e get_role( unsigned char *meid );
 
 #endif
