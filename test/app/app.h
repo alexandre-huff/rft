@@ -33,6 +33,7 @@
 #define RAN1_MSG	100
 #define RAN2_MSG	101
 #define RAN3_MSG	102
+#define RAN4_MSG	300
 
 /*
 	Macro to add nanoseconds in a timespec

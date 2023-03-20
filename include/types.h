@@ -41,7 +41,7 @@
 */
 typedef char server_id_t[ RMR_MAX_SRC ];
 
-typedef char target_t[ RMR_MAX_SRC ];
+typedef char target_t[ RMR_MAX_SRC + 6 ];	// includes 6 bytes to append port number ":65000"
 
 typedef unsigned long term_t;	// defines the raft term's type
 
@@ -366,5 +366,14 @@ typedef struct raft_snapshot_reply {
 	index_t last_index;			// last log index the snapshot replaces in the raft server
 	server_id_t server_id;		// identifies the server which is replying this message
 } raft_snapshot_reply_t;
+
+typedef struct bootstrap_info {
+	int rft_port;
+	struct {
+		int port;
+		char host[128];
+		char key[256];	// the key used to get/set leader endpoint from/to Redis server
+	} redis;
+} bootstrap_info_t;
 
 #endif

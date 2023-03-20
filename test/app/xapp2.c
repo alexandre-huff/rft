@@ -273,6 +273,7 @@ void *listener( void *mrc ) {
 				case RAN1_MSG:
 				case RAN2_MSG:
 				case RAN3_MSG:
+				case RAN4_MSG:
 					#if LOGGER_LEVEL >= LOGGER_ERROR
 						payload = (mpl_t *) msg->payload;
 					#endif
@@ -307,7 +308,7 @@ void *listener( void *mrc ) {
 							case RMR_ERR_SENDFAILED:
 								sfailed++;
 								#if LOGGER_LEVEL >= LOGGER_ERROR
-									logger_error( "reply failed, mtype: %d, state: %d, strerr: %s\n",
+									logger_error( "reply failed, mtype: %d, state: %d, strerr: %s",
 													msg->mtype, msg->state, strerror( errno ) );
 								#endif
 								break;
@@ -468,11 +469,11 @@ int main( int argc, char **argv ) {
 							count, replied, retries, sfailed, errors );
 							last_count = count;
 			}
-			}
+		}
 	#endif
 	// unreachable with LOGGER_INFO
 	for( i = 0; i < nthreads; i++ ) {
-			pthread_join( threads[i], NULL );
+		pthread_join( threads[i], NULL );
 	}
 	free( threads );
 

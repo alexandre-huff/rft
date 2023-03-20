@@ -1,4 +1,4 @@
-// :vim ts=4 sw=4 noet:
+// vim: ts=4 sw=4 noet
 /*
 ==================================================================================
 	Copyright (c) 2019-2020 AT&T Intellectual Property.
@@ -50,11 +50,12 @@
 
 #include "static/hashtable.c"	// static hashtable
 #include "static/ringbuf.c"		// static FIFO ring buffer
+#include "static/redis.c"		// static Redis wrapper
 
 /* ############ Prototypes ############ */
 
 void *worker( );
-void *trigger_election_timeout( );
+void *trigger_election_timeout( void *args );
 void *state_replication( );
 void become_follower( );
 void become_leader( );
@@ -226,6 +227,58 @@ void unlock_raft_state( ) {
 }
 
 /*
+	This function is in charge of initialize the RFT cluster
+
+	When the replica starts, it tries to set the leader key in the Redis to determine whether or not
+	there is a leader in the cluster. If the leader key was already defined, then the set operation fails.
+	In case of success, i.e., the replica was able to set the key in Redis, then this replica will become
+	the	leader as no other replica was able to set that key before.
+
+	Returns 1 on success, 0 otherwise.
+*/
+int bootstrap_rft_cluster( bootstrap_info_t *binfo, redisContext *c ) {
+	log_entry_t *entry = NULL;
+	server_conf_cmd_data_t cmd_data = {
+		.server_id = {'\0'},
+		.target = {'\0'}
+	};
+
+	if( c == NULL ) {
+		logger_error( "invalid redis context: nil?" );
+		return 0;
+	}
+
+	snprintf( cmd_data.server_id, sizeof(server_id_t), "%s", me.self_id );
+	snprintf( cmd_data.target, sizeof(target_t), "%s:%d", me.self_id, binfo->rft_port );
+
+	if( redis_sync_set_if_no_key( c, binfo->redis.key, cmd_data.target ) ) {	// other replica might set (concurrent)
+		logger_info( "bootstrapping RFT cluster" );
+
+		if( ! raft_config_add_server( (server_id_t *) cmd_data.server_id, (target_t *) cmd_data.target, 0 ) ) {	// add itself to raft configuration servers
+			logger_fatal( "unable to initialize RFT cluster configuration in %s", __func__ );
+			exit( 1 );
+		}
+
+		// add myself configuration in the very first append entries log and commit it (this is the only server in the cluster so far)
+		entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &cmd_data, sizeof(server_conf_cmd_data_t) );
+		if( entry == NULL ) {
+			logger_fatal( "unable to allocate log entry memory for bootstrapping RFT configuration" );
+			exit( 1 );
+		}
+		append_raft_log_entry( entry );
+		raft_commit_log_entries( get_raft_last_log_index( ) );	// it should be 1, calling the function just to make sure
+
+		// we need to send the first message here, since at applying the first entry, this server is not the leader yet
+		logger_info( "send message to routing manager ===== %s %s =====", "ADD_ROUTE", cmd_data.target );
+
+	} else {
+		return 0;	// other replica has already set
+	}
+
+	return 1;
+}
+
+/*
 	Initializes the RFT library
 
 	_mrc: message router context (rmr)
@@ -237,18 +290,11 @@ void unlock_raft_state( ) {
 void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_cb_t apply_state_cb,
 					take_snapshot_cb_t take_snapshot_cb, install_snapshot_cb_t install_snapshot_cb ) {
 	server_id_t wbuf;
-	target_t target;
 	char *rft_id;			// used to change the server_id's name
 	char *envptr;			// general pointer to an environment variable value
-	char *bootstrap;		// holds the server_id that must initialize the raft configuration
-	char target_buf[256];
 	int err = 0;
-	log_entry_t *entry = NULL;
-	server_conf_cmd_data_t cmd_data = {
-		.server_id = {'\0'},
-		.target = {'\0'}
-	};
 	unsigned int threshold;	// threshold of the log size (in Mbytes) to trigger a snapshot function
+	int len;
 
 #if LOGGER_LEVEL < LOGGER_INFO
 	fprintf( stderr, "%lu %d/RFT [INFO] initializing RFT library\n", (unsigned long)time( NULL ), getpid( ) );
@@ -342,37 +388,39 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		exit( 1 );
 	}
 
-	/*
-		Getting environment variable to check if rft cluster needs to be boostrapped
-	*/
-	bootstrap = getenv( "RFT_BOOTSTRAP" );
-	if( bootstrap != NULL ) {
-		if( strcmp( bootstrap, rft_id ) == 0 ) {	// checks if this server is in charge of boostrapping the cluster
-			logger_info( "bootstrapping RFT cluster" );
-
-			snprintf( target_buf, sizeof(target_buf), "%s:%s", rft_id, listen_port );
-			strncpy( target, target_buf, sizeof(target) - 1 );
-			target[sizeof(target) - 1] = '\0';	// ensuring the string is null-terminated
-			if( ! raft_config_add_server( (server_id_t *) rft_id, &target, 0 ) ) {	// add itself to raft configuration servers
-				logger_fatal( "unable to initialize RFT cluster configuration in rft_init" );
-				exit( 1 );
-			}
-
-			// add myself configuration in the very first append entries log and commit it (this is the only server in the cluster so far)
-			strcpy( cmd_data.server_id, rft_id );
-			strcpy( cmd_data.target, target );
-			entry = new_raft_log_entry( 1, RAFT_CONFIG, ADD_MEMBER, &cmd_data, sizeof(server_conf_cmd_data_t) );
-			if( entry == NULL ) {
-				logger_fatal( "unable to allocate log entry memory for bootstrapping RFT configuration" );
-				exit( 1 );
-			}
-			append_raft_log_entry( entry );
-			raft_commit_log_entries( get_raft_last_log_index( ) );	// it should be 1, calling the function just to make sure
-
-			// we need to send the first message here, since at applying the first entry, this server is not the leader yet
-			logger_info( "send message to routing manager ===== %s %s =====", "ADD_ROUTE", target_buf );
-		}
+	bootstrap_info_t *binfo = (bootstrap_info_t *) malloc( sizeof(bootstrap_info_t) );
+	if( binfo == NULL ) {
+		logger_fatal( "unable to allocate memory to store bootstrap metadata info" );
+		exit( 1 );
 	}
+
+	envptr = getenv( "RFT_BOOTSTRAP_KEY" );
+	if( envptr != NULL ) {
+		// TODO update this key with a unique key for a group of xApps, for now we use an env var
+		len = snprintf( binfo->redis.key, sizeof(binfo->redis.key), "%s", envptr );
+	} else {
+		len = snprintf( binfo->redis.key, sizeof(binfo->redis.key), "%s", BOOTSTRAP_REDIS_KEY );
+	}
+	if( len >= sizeof(binfo->redis.key) ) {
+		logger_fatal( "redis key to bootstrap the RFT cluster is too long; > 255" );
+		exit( 1 );
+	}
+
+	envptr = getenv( "REDIS_HOST" );
+	if( envptr != NULL ) {
+		snprintf( binfo->redis.host, sizeof(binfo->redis.host), "%s", envptr );
+	} else {
+		snprintf( binfo->redis.host, sizeof(binfo->redis.host), "%s", BOOTSTRAP_REDIS_HOST );
+	}
+
+	envptr = getenv( "REDIS_PORT" );
+	if( envptr != NULL ) {
+		binfo->redis.port = parse_int( envptr );
+	} else {
+		binfo->redis.port = BOOTSTRAP_REDIS_PORT;
+	}
+
+	binfo->rft_port = parse_int( listen_port );
 
 	tasks = ring_create( 32768, ( RING_MP | RING_EBLOCK ) ); // multi-producer and single-consumer read-blocking ring
 	if (tasks == NULL ) {
@@ -393,7 +441,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 	}
 
 	pthread_create( &worker_th, NULL, worker, NULL );
-	pthread_create( &election_timeout_th, NULL, trigger_election_timeout, NULL );
+	pthread_create( &election_timeout_th, NULL, trigger_election_timeout, binfo );
 	pthread_create( &replication_th, NULL, state_replication, NULL );
 }
 
@@ -634,17 +682,22 @@ int rft_send_wh_msg( rmr_mbuf_t **msg, rmr_whid_t whid, int mtype, int payload_s
 }
 
 /*
-	Sends membership requests (discovery messages) to all servers in the cluster waiting for the leader reply
+	Sends membership requests (discovery messages) to the leader of the cluster and waits for its reply
 
+	This function fetches the current leader endpoint from Redis database.
 	Expects that the leader of the cluster sends log entries that must be commited by this server through AppendEntry messages
 	NOTE: this function does not process AppendEntries, it only waits for an election_timeout and sends the discovery message again
 		  in case of no leader reply
 */
-void send_membership_request( rmr_mbuf_t **msg ) {
+void send_membership_request( rmr_mbuf_t **msg, redisContext *c, bootstrap_info_t *binfo ) {
 	membership_request_t *membership_msg = NULL;
 	struct timespec timeout;
 	index_t prior;		// defines the last_log_index of the previous timeout
 	index_t current;	// defines the last_log_index of the current timeout
+	server_id_t target = { 0, };	// target to send requests
+	rmr_whid_t whid = -1;	// disconnected
+	struct timespec now;
+	struct timespec stop;	// timer to give up to send requests and exit the application
 
 	assert( (*msg) != NULL );
 	if( me.state != INIT_SERVER ) {
@@ -656,32 +709,68 @@ void send_membership_request( rmr_mbuf_t **msg ) {
 
 	logger_info( "discovering the leader of the cluster" );
 
-	prior = get_raft_last_log_index( );
+	timespec_get( &stop, TIME_UTC );
+	timespec_add_ms( stop, 20000 );	// should join the cluster within 20sec
 
 	pthread_mutex_lock( &raft_state_lock );
-
 	while( me.state == INIT_SERVER ) {
+		pthread_mutex_unlock( &raft_state_lock );
 
-		current = get_raft_last_log_index( );
+		redisReply *resp = redis_sync_get_value( c, binfo->redis.key );
+		if( resp != NULL ) {
+			// if they are different then disconnect from the old and connect to new endpoint
+			if( ( resp->str != NULL ) && ( strcmp( resp->str, target ) != 0 ) ) {
+				if( RMR_WH_CONNECTED( whid ) ) {	// close the old connection
+					rmr_wh_close( mrc, whid );
+				}
 
-		if( prior == current ) {	// it means that this server does not make progress since last timeout
-			membership_msg = (membership_request_t *) (*msg)->payload;
-			membership_msg->last_log_index = get_raft_last_log_index( );
-			strcpy( membership_msg->server_id, me.self_id );
+				snprintf(target, sizeof(target), "%s", resp->str );
 
-			logger_debug( "sending membership request last_log_index: %lu", membership_msg->last_log_index );
-			rft_send_msg( msg, MEMBERSHIP_REQ, sizeof( *membership_msg ) );
+				whid = rmr_wh_open( mrc, target );	// open the new connection
+			}
 
-			prior = current;
+			freeReplyObject( resp );
+
+			if( RMR_WH_CONNECTED( whid ) ) {
+				prior = get_raft_last_log_index( );
+
+				pthread_mutex_lock( &raft_state_lock );
+
+				if( me.state == INIT_SERVER ) {
+
+					current = get_raft_last_log_index( );
+
+					if( prior == current ) {	// it means that this server does not make progress since last timeout
+						membership_msg = (membership_request_t *) (*msg)->payload;
+						membership_msg->last_log_index = get_raft_last_log_index( );
+						strcpy( membership_msg->server_id, me.self_id );
+
+						logger_debug( "sending membership request last_log_index: %lu", membership_msg->last_log_index );
+						rft_send_wh_msg( msg, whid, MEMBERSHIP_REQ, sizeof( *membership_msg ), &target );
+
+						prior = current;
+					}
+
+					timespec_get( &timeout, TIME_UTC);
+					timespec_add_ms( timeout, rand_timeout_ms );
+
+					pthread_cond_timedwait( &raft_state_cond, &raft_state_lock, &timeout );
+				}
+			} else {
+				sleep( 1 );	// avoid spinning up the CPU
+			}
+
+			timespec_get( &now, TIME_UTC );
+			if( timespec_cmp( now, stop, > ) ) {
+				logger_fatal( "unable to send membership requests to %s; does is it alive? does is it the leader?", target );
+				exit( 1 );
+			}
 		}
 
-		timespec_get( &timeout, TIME_UTC);
-		timespec_add_ms( timeout, rand_timeout_ms );
-
-		pthread_cond_timedwait( &raft_state_cond, &raft_state_lock, &timeout );
+		pthread_mutex_unlock( &raft_state_lock );
 	}
 
-	pthread_mutex_unlock( &raft_state_lock );
+	rmr_wh_close( mrc, whid );
 }
 
 /*
@@ -1900,16 +1989,23 @@ void handle_raft_snapshot_reply( raft_snapshot_reply_t *reply ) {
 
 	When server becomes leader, this thread put itself to sleep. Requires a signal when happens a transition to FOLLOWER
 */
-void *trigger_election_timeout( ) {
+void *trigger_election_timeout( void *args ) {
 	int state;
 	struct timespec now;
 	rmr_mbuf_t *mbuf = NULL;
+	redisContext *c;
+	target_t my_target;	// myself target
+
+	bootstrap_info_t *binfo = (bootstrap_info_t *)args;
 
 	mbuf = rmr_alloc_msg( mrc, RMR_MAX_RCV_BYTES );
 	if( mbuf == NULL ) {
 		logger_fatal( "unable to allocate memory on trigger_election_timeout: %s", strerror( errno ) );
 		exit( 1 );
 	}
+
+	// we do not need to lock the "me" struct since now we are still in INIT_SERVER state
+	snprintf( my_target, sizeof(target_t), "%s:%d", me.self_id, binfo->rft_port );
 
 	while ( 1 ) {
 
@@ -1933,6 +2029,14 @@ void *trigger_election_timeout( ) {
 				break;
 
 			case LEADER:	// just stops running this thread and waits for a signal originated when it became follower for some reason
+				c = redis_sync_init( binfo->redis.host, binfo->redis.port );
+				if( c == NULL ) {
+					logger_fatal( "unable to become leader: connection error to Redis server at %s:%d", binfo->redis.host, binfo->redis.port );
+					exit( 1 );
+				}
+				redis_sync_set_key( c, binfo->redis.key, my_target );	// set myself as the leader to allow new xApps join the cluster
+				redis_sync_disconnect( c );
+
 				pthread_mutex_lock( &follower_lock );
 				pthread_cond_wait( &follower_cond, &follower_lock );
 				pthread_mutex_unlock( &follower_lock );
@@ -1944,7 +2048,17 @@ void *trigger_election_timeout( ) {
 				break;
 
 			case INIT_SERVER:
-				send_membership_request( &mbuf );
+				c = redis_sync_init( binfo->redis.host, binfo->redis.port );
+				if( c == NULL ) {
+					logger_fatal( "unable to bootstrap RFT: connection error to Redis server at %s:%d", binfo->redis.host, binfo->redis.port );
+					exit( 1 );
+				}
+
+				if( !bootstrap_rft_cluster( binfo, c ) ) {
+					send_membership_request( &mbuf, c, binfo );
+				}
+
+				redis_sync_disconnect( c );
 
 				break;
 
@@ -1954,7 +2068,7 @@ void *trigger_election_timeout( ) {
 		}
 
 	}
-
+	free( binfo );	// for now it is unreachable
 }
 
 /*

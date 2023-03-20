@@ -24,7 +24,7 @@
 CC = gcc
 
 CFLAGS = -g -Wall -O3 -I$(INCLUDEDIR) -DLOGGER_LEVEL=LOGGER_INFO
-LDFLAGS = -lrmr_si -lpthread -lm
+LDFLAGS = -lrmr_si -lpthread -lm -lhiredis
 
 # DEPFLAGS = -MMD -MP -MT $@ -MF $(DEPDIR)/$*.d
 DEPFLAGS = -MMD -MP -MF $(DEPDIR)/$*.d
@@ -54,7 +54,7 @@ all: $(APPS)
 $(APPS):
 
 %: %.c $(OBJS)
-	$(CC) -o $@ $< $(CFLAGS) $(DEPFLAGS) $(LDFLAGS) $(OBJS)
+	$(CC) -o $@ $< $(CFLAGS) $(DEPFLAGS) $(OBJS) $(LDFLAGS)
 
 $(BUILDDIR)/%.o : $(SRCDIR)/%.c $(DEPDIR)/%.d | $(DEPDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<

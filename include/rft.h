@@ -81,6 +81,14 @@
 #define LOG_SIZE_THRESHOLD		10
 
 /*
+	Defines constants to access Redis database which is used to bootstrap the RFT cluster
+	while the instance is in the INIT_SERVER state
+*/
+#define BOOTSTRAP_REDIS_HOST "service-ricplt-dbaas-tcp.ricplt"
+#define BOOTSTRAP_REDIS_PORT 6379
+#define BOOTSTRAP_REDIS_KEY "rft.leader"	// defines the default key RFT will set/get on bootstrapping and when becomes leader
+
+/*
 	Defines the role that an xApp replica plays for a given Managed Equipment
 */
 typedef enum role {
