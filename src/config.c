@@ -257,7 +257,7 @@ int raft_config_add_server( server_id_t *server_id, target_t *target, index_t la
 	A server is removed from the raft configuration when a remove membership log entry is
 	added to the log, or when removing conflicting log entries
 
-	Note: This is an internal function of the config module and must be called by a wrapper funtion
+	Note: This is an internal function of the config module and must be called by a wrapper function
 	inside this module
 
 	IMPORTANT: This function is not thread-safe, it assumes that the caller owns the

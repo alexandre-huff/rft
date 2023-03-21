@@ -160,4 +160,116 @@ int redis_sync_set_key( redisContext *c, char *key, char *value ) {
 	return ret;
 }
 
+/*
+	Safely deletes the enpoint of the key on Redis server
+
+	This function implements a transaction that only removes the key if it
+	stores the corresponding enpoint in Redis.
+
+	Trying to execute the following:
+		WATCH mykey
+		val = GET mykey
+		if (val == endpoint) then
+			MULTI
+			DEL mykey
+			EXEC
+		endif
+
+	Returns:
+		1 on deletion success;
+		1 when another replica already changed the endpoint of the key;
+		0 on error.
+*/
+int redis_sync_safe_ep_del( redisContext *c, char *key, char *endpoint ) {
+	redisReply *multi;
+	redisReply *delete;
+	redisReply *exec;
+
+	redisReply *reply = redisCommand( c, "WATCH %s", key );
+	if( reply == NULL ) {
+		logger_error( "command error: %s", c->errstr );
+		/*
+			Once an error is returned the context cannot be reused and you should set up a new connection
+			An error message could be returned, but we chose to exit the application
+		*/
+		if( redisReconnect( c ) != REDIS_OK ) {
+			logger_fatal( "unable to reconnect using the previous redis context" );
+			exit( 1 );
+		}
+	}
+	if( reply->len ) { // expecting "OK"
+		if( strcmp( reply->str, "OK" ) != 0 ) {
+			freeReplyObject( reply );
+            return 0;
+        }
+    }
+	freeReplyObject( reply );
+
+	reply = redis_sync_get_value( c, key );
+	if( reply == NULL ) {
+		logger_error( "unable to get key '%s'", key );
+		return 0;
+	}
+	if( reply->str == NULL ) {
+		logger_error( "redis did not return a string for key '%s'", key);
+		freeReplyObject( reply );
+		return 0;
+	}
+
+	// in case another replica already became the leader, the enpoint was changed and is different of our self_id
+	if( strcmp( reply->str, endpoint ) != 0 ) {
+		freeReplyObject( reply );
+
+		reply = redisCommand( c, "UNWATCH" );	// watch is no longer required
+		if( reply == NULL ) {
+			logger_error( "unable to call UNWATCH on Redis server" );
+			return 0;
+		}
+		freeReplyObject( reply );
+		return 1;	// we can consider this as success as another replica became the leader
+	}
+
+	// if we reach here, then the key stored in redis is our target endpoint
+	multi = redisCommand( c, "MULTI" );
+	if( multi == NULL ) {
+		logger_error( "unable to call MULTI on Redis server" );
+		return 0;
+	}
+	if( multi->str && ( strcmp( multi->str, "OK" ) != 0 ) ) {
+		logger_error( "Redis command MULTI did not return OK" );
+		freeReplyObject( multi );
+		return 0;
+	}
+
+	delete = redisCommand( c, "DEL %s", key );
+	if( delete == NULL ) {
+		logger_error( "unable to call DEL on Redis server" );
+		return 0;
+	}
+	if( delete->str && ( strcmp( delete->str, "QUEUED" ) != 0 ) ) {
+		logger_error( "unable to delete key '%s' from Redis server", key );
+		freeReplyObject( delete );
+		return 0;
+	}
+
+	exec = redisCommand( c, "EXEC");
+	if( exec == NULL ) {
+		logger_error( "unable to call EXEC on Redis server" );
+		return 0;
+	}
+	if( exec->elements != 1 ) {
+		logger_error( "EXEC command did not execute successfully");
+		freeReplyObject( delete );
+		return 0;
+	}
+
+	logger_info( "key '%s' was successfully deleted from Redis server", key );
+
+	freeReplyObject( multi );
+	freeReplyObject( delete );
+	freeReplyObject( exec );
+
+	return 1;	// success of transaction
+}
+
 #endif

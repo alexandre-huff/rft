@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <assert.h>
+#include <signal.h>
 
 #include <pthread.h>
 #include <rmr/rmr.h>
@@ -55,7 +56,7 @@
 /* ############ Prototypes ############ */
 
 void *worker( );
-void *trigger_election_timeout( void *args );
+void *trigger_election_timeout( );
 void *state_replication( );
 void become_follower( );
 void become_leader( );
@@ -130,6 +131,9 @@ install_snapshot_cb_t install_xapp_snapshot_cb;
 int installing_xapp_snapshot = 0;		// defined whether or not an install xapp snapshot is in progress, to avoid duplicate messages
 int installing_raft_snapshot = 0;		// defined whether or not an install xapp snapshot is in progress, to avoid duplicate messages
 
+bootstrap_info_t *binfo = NULL;			// attributes used to bootstrap rft and redis connection
+
+static volatile sig_atomic_t ok2run = 1;		// controls if all run loops should keep running
 
 /* ############ Implementation ############ */
 
@@ -388,7 +392,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 		exit( 1 );
 	}
 
-	bootstrap_info_t *binfo = (bootstrap_info_t *) malloc( sizeof(bootstrap_info_t) );
+	binfo = (bootstrap_info_t *) malloc( sizeof(bootstrap_info_t) );
 	if( binfo == NULL ) {
 		logger_fatal( "unable to allocate memory to store bootstrap metadata info" );
 		exit( 1 );
@@ -441,7 +445,7 @@ void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply_state_
 	}
 
 	pthread_create( &worker_th, NULL, worker, NULL );
-	pthread_create( &election_timeout_th, NULL, trigger_election_timeout, binfo );
+	pthread_create( &election_timeout_th, NULL, trigger_election_timeout, NULL );
 	pthread_create( &replication_th, NULL, state_replication, NULL );
 }
 
@@ -1081,7 +1085,7 @@ void *raft_server( void *new_server ) {
 		exit( 1 );
 	}
 
-	while( ( server->active == RUNNING ) && ( !RMR_WH_CONNECTED( whid ) ) ) {
+	while( ok2run && ( server->active == RUNNING ) && ( !RMR_WH_CONNECTED( whid ) ) ) {
 		for( count = 10; count && server->active == RUNNING; count-- )	{
 			whid = rmr_wh_open( mrc, server->target );
 			if( RMR_WH_CONNECTED( whid ) ) {
@@ -1132,7 +1136,7 @@ void *raft_server( void *new_server ) {
 	}
 
 #if !defined(INSIDE_UNITTEST)
-	while ( server->active ) {
+	while ( ok2run && server->active ) {
 #endif
 		/*
 			Only used to put this thread to sleep (cond_wait)
@@ -1145,7 +1149,7 @@ void *raft_server( void *new_server ) {
 			so, we don't lock raft_state here, no harmful code will be executed
 		*/
 	#if !defined(INSIDE_UNITTEST)
-		while( me.state == LEADER && server->active == RUNNING ) {
+		while( ok2run && me.state == LEADER && server->active == RUNNING ) {
 	#endif
 			n_entries = 0;
 			bytes = 0;
@@ -1315,12 +1319,12 @@ void *state_replication( ) {
 	pthread_mutex_lock( &replica_lock );
 	must_lock = 0;		// there is no need to get the lock again before going to sleep
 
-	while( 1 ) {
+	while( ok2run ) {
 		/*
 			When moving from a two server cluster to one server due to failure, the raft_get_num_servers()
 			guarantees that the replication thread is going to sleep
 		*/
-		while( replica_servers.len == 0 || raft_get_num_servers( ) == 1 ) {
+		while( ok2run && ( replica_servers.len == 0 || raft_get_num_servers( ) == 1 ) ) {
 			logger_info( "waiting for a replica to initialize the xapp state replication" );
 			pthread_cond_wait( &replica_cond, &replica_lock );
 
@@ -1400,6 +1404,8 @@ void *state_replication( ) {
 		pthread_cond_timedwait( &replica_cond, &replica_lock, &timeout );
 		must_lock = 0;		// no lock is required, as we have the lock
 	}
+
+	return NULL;
 }
 
 /*
@@ -1546,7 +1552,7 @@ void raft_apply_log_entries( ) {
 	log_entry_t *entry;
 	server_conf_cmd_data_t *data;
 	server_t *server = NULL;
-	int config_myself;		// defines it the config command is for me
+	int config_myself;		// defines if the config command is for me
 	int cfg_change = 0;		// identifies if a new configuration is being applied
 	char wbuf[50];
 
@@ -1989,14 +1995,12 @@ void handle_raft_snapshot_reply( raft_snapshot_reply_t *reply ) {
 
 	When server becomes leader, this thread put itself to sleep. Requires a signal when happens a transition to FOLLOWER
 */
-void *trigger_election_timeout( void *args ) {
+void *trigger_election_timeout( ) {
 	int state;
 	struct timespec now;
 	rmr_mbuf_t *mbuf = NULL;
 	redisContext *c;
 	target_t my_target;	// myself target
-
-	bootstrap_info_t *binfo = (bootstrap_info_t *)args;
 
 	mbuf = rmr_alloc_msg( mrc, RMR_MAX_RCV_BYTES );
 	if( mbuf == NULL ) {
@@ -2007,7 +2011,7 @@ void *trigger_election_timeout( void *args ) {
 	// we do not need to lock the "me" struct since now we are still in INIT_SERVER state
 	snprintf( my_target, sizeof(target_t), "%s:%d", me.self_id, binfo->rft_port );
 
-	while ( 1 ) {
+	while ( ok2run ) {
 
 		pthread_mutex_lock( &raft_state_lock );
 		state = me.state;
@@ -2068,7 +2072,9 @@ void *trigger_election_timeout( void *args ) {
 		}
 
 	}
-	free( binfo );	// for now it is unreachable
+	free( binfo );
+
+	return NULL;
 }
 
 /*
@@ -2102,7 +2108,7 @@ void *worker( ) {
 	req_xapp_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
 	req_raft_snapshot_msg.snapshot.data = NULL;	// assuring that realloc wont fail due an unsafe pointer
 
-	while( 1 ) {	// This is a worker thread that processes messages enqueued by the xApp
+	while( ok2run ) {	// This is a worker thread that processes messages enqueued by the xApp
 
 		msg = (rmr_mbuf_t *) ring_extract( tasks );	// Dequeues rft messages from the task ring (consumer)
 		if( msg == NULL ) {
@@ -2339,6 +2345,7 @@ void *worker( ) {
 		rmr_free_msg( msg );			// message must be freed since it is a copy dequeued from rft's queue
 	}
 
+	return NULL;
 }
 
 /*
@@ -2364,4 +2371,48 @@ index_t get_full_replicated_log_index( ) {
 	pthread_mutex_unlock( &replica_lock );
 
 	return last_index;
+}
+
+void rft_shutdown( ) {
+	struct timespec timeout;
+
+	logger_info( "Shutting down RFT library");
+
+	ok2run = 0;
+
+	if( me.state == LEADER ) {	// we do not need to lock here since we double check the state below
+		timespec_get( &timeout, TIME_UTC );
+		timespec_add_ms( timeout, ( ELECTION_TIMEOUT * 2 ) );
+
+		pthread_mutex_lock( &follower_lock );
+		pthread_cond_timedwait( &follower_cond, &follower_lock, &timeout );
+		pthread_mutex_unlock( &follower_lock );
+
+		pthread_mutex_lock( &raft_state_lock );
+		if( me.state == LEADER ) {
+			server_t *server = raft_config_get_server( &me.self_id );
+			if( server != NULL ) {
+				redisContext *c = redis_sync_init( binfo->redis.host, binfo->redis.port );
+				if( c != NULL ) {
+					if( ! redis_sync_safe_ep_del( c, binfo->redis.key, server->target ) ) {
+						logger_error( "unable to delete bootstrap key '%s' from Redis server", binfo->redis.key );
+					}
+
+				} else {
+					logger_error( "unable to fully shutdown RFT: connection error to Redis server at %s:%d", binfo->redis.host, binfo->redis.port );
+				}
+
+				redis_sync_disconnect( c );
+			} else {
+				logger_error( "unable to get raft server %s", me.self_id );
+			}
+		}
+		pthread_mutex_unlock( &raft_state_lock );
+	}
+
+	pthread_cond_signal( &raft_state_cond );
+	pthread_cond_signal( &election_timeout_cond );
+	pthread_cond_signal( &follower_cond );	// check ther order of follower and leader
+	pthread_cond_signal( &replica_cond );
+	pthread_cond_broadcast( &leader_cond );
 }

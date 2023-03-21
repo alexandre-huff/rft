@@ -118,5 +118,6 @@ extern void rft_init( void *_mrc, char *listen_port, int rmr_max_msg_size, apply
 extern int rft_enqueue_msg( rmr_mbuf_t *msg );
 extern int rft_replicate( int command, const char *context, const char *key, unsigned char *value, size_t len, unsigned char *meid, role_e role );
 extern role_e get_role( unsigned char *meid );
+extern void rft_shutdown();
 
 #endif

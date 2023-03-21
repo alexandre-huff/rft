@@ -35,6 +35,7 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include <rmr/rmr.h>
 
@@ -86,6 +87,25 @@ long	sfailed = 0;
 const long ivalue = 1;		// increment value
 pthread_mutex_t fsm_lock = PTHREAD_MUTEX_INITIALIZER;	// state machine lock
 static hashtable_t *ctx_table = NULL;
+
+volatile sig_atomic_t ok2run = 1;
+
+void signal_handler(int signal) {
+  switch (signal) {
+    case SIGINT:
+      logger_info("SIGINT was received");
+      break;
+
+    case SIGTERM:
+      logger_info("SIGTERM was received");
+      break;
+
+    default:
+      logger_warn("signal handler received signal %s", strsignal(signal));
+      break;
+  }
+  ok2run = 0;
+}
 
 // function that will be called by the rft library
 void apply_state( const int cmd, const char *context, const char *key, const unsigned char *data, const size_t dlen ) {
@@ -245,8 +265,8 @@ void *listener( void *mrc ) {
 		unsigned char target[RMR_MAX_SRC];
 	#endif
 
-	while ( 1 ) { // listener for all incomming messages
-		msg = rmr_rcv_msg( mrc, msg );
+	while ( ok2run ) { // listener for all incomming messages
+		msg = rmr_torcv_msg( mrc, msg, 2000 );
 
 		if ( msg && msg->state == RMR_OK ) {
 
@@ -350,9 +370,12 @@ void *listener( void *mrc ) {
 				break;
 			}
 		} else {
+			if( msg )
 			logger_error( "unable to receive message, type :%d, state: %d, errno: %d", msg->mtype, msg->state, errno );
 		}
 	}
+
+	rft_shutdown( );
 
 	return NULL;
 }
@@ -458,11 +481,20 @@ int main( int argc, char **argv ) {
 		}
 	}
 
+	/* ===== installing signal handlers ===== */
+    struct sigaction sa;
+    sa.sa_handler = &signal_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+	/* ===== up and running ===== */
 	logger_info( "listening on port %s", listen_port );
 
 	/* ===== Stats ===== */
 	#if LOGGER_LEVEL >= LOGGER_INFO
-		while( 1 ) {
+		while( ok2run ) {
 			sleep( 5 );
 			if( last_count != count ) {
 				logger_info( "========== Requests: %ld\tReplied: %ld\tRetries: %ld\tSend Failed: %ld\t\tErrors: %ld ==========",
@@ -471,7 +503,7 @@ int main( int argc, char **argv ) {
 			}
 		}
 	#endif
-	// unreachable with LOGGER_INFO
+
 	for( i = 0; i < nthreads; i++ ) {
 		pthread_join( threads[i], NULL );
 	}
