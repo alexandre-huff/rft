@@ -55,6 +55,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
+#include <string.h>
 
 #include "logger.h"
 
@@ -75,6 +76,13 @@ void logger_log(int level, const char *file, int line, const char *fmt, ...) {
 	char buf[16];
 	char bufcat[32];
 	struct timespec now;
+	char *filename;
+
+	filename = strrchr( file, '/' );
+	if( filename != NULL )
+		filename++;
+	else
+		filename = (char *) file;
 
 	/* Acquire locking to ensure that all information of a log line is atomically written */
 	flockfile( stderr );
@@ -89,9 +97,9 @@ void logger_log(int level, const char *file, int line, const char *fmt, ...) {
 #ifdef LOGGER_USE_COLOR
 	fprintf(
 	stderr, "%s %s%-5s\x1b[0m \x1b[90m%s:%d\x1b[0m ",
-	bufcat, level_colors[level], level_names[level], file, line);
+	bufcat, level_colors[level], level_names[level], filename, line);
 #else
-	fprintf(stderr, "%s %-5s %s:%d: ", bufcat, level_names[level], file, line);
+	fprintf(stderr, "%s %-5s %s:%d: ", bufcat, level_names[level], filename, line);
 #endif
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);

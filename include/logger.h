@@ -64,9 +64,13 @@
 #ifndef _LOGGER_H
 #define _LOGGER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define LOGGER_USE_COLOR		// comment if too fancy, or compile with -DLOGGER_USE_COLOR
 
-#define LOGGER_VERSION "0.2.0"
+#define LOGGER_VERSION "0.2.1"
 
 #define LOGGER_PADDING 20
 
@@ -79,7 +83,7 @@
 #define LOGGER_DEBUG	5
 #define LOGGER_TRACE	6
 
-#ifndef LOGGER_LEVEL	// can be passed in compile time with -DLOGGER_LEVEL=number
+#ifndef LOGGER_LEVEL	// can be passed in compile time with -DLOGGER_LEVEL=number or e.g. LOGGER_INFO
 #define LOGGER_LEVEL	LOGGER_INFO
 #endif
 
@@ -122,5 +126,9 @@
 #define logger_force(level, message, args...) logger_log(level, __FILE__, __LINE__, message "\n", ## args)
 
 void logger_log(int level, const char *file, int line, const char *fmt, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
