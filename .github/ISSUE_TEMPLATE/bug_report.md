@@ -10,6 +10,15 @@ assignees: ''
 **Describe the bug**
 A clear and concise description of what the bug is.
 
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Describe alternatives you might have considered**
+A clear and concise description of any alternative solutions or features you've considered.
+
+**Screenshots**
+If applicable, add screenshots to help explain your problem.
+
 **To Reproduce**
 Steps to reproduce the behavior:
 1. Go to '...'
@@ -17,16 +26,10 @@ Steps to reproduce the behavior:
 3. Scroll down to '....'
 4. See error
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
-
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
-
 **Desktop (please complete the following information):**
  - OS: [e.g. Linux]
  - Version [e.g. 22]
- - RFT version
+ - RFT version/commit
 
 **Additional context**
 Add any other context about the problem here.
