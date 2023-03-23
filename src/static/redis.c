@@ -226,6 +226,7 @@ int redis_sync_safe_ep_del( redisContext *c, char *key, char *endpoint ) {
 			return 0;
 		}
 		freeReplyObject( reply );
+		logger_warn( "another replica alredy became the leader; nothing done with bootstrap key '%s' in Redis", key );	// FIXME change this to logger_debug
 		return 1;	// we can consider this as success as another replica became the leader
 	}
 

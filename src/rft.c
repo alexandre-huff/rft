@@ -2038,7 +2038,12 @@ void *trigger_election_timeout( ) {
 					logger_fatal( "unable to become leader: connection error to Redis server at %s:%d", binfo->redis.host, binfo->redis.port );
 					exit( 1 );
 				}
-				redis_sync_set_key( c, binfo->redis.key, my_target );	// set myself as the leader to allow new xApps join the cluster
+				if( redis_sync_set_key( c, binfo->redis.key, my_target ) ) {	// set myself as the leader to allow new xApps join the cluster
+					logger_info( "set bootstrap key '%s' to target '%s' in Redis", binfo->redis.key, my_target );
+				} else {
+					logger_fatal( "unable to set bootstrap key '%s' to target '%s' in Redis after becoming leader", binfo->redis.key, my_target );
+					exit( 1 );
+				}
 				redis_sync_disconnect( c );
 
 				pthread_mutex_lock( &follower_lock );
@@ -2072,7 +2077,6 @@ void *trigger_election_timeout( ) {
 		}
 
 	}
-	free( binfo );
 
 	return NULL;
 }
@@ -2383,7 +2387,6 @@ void rft_shutdown( ) {
 	if( me.state == LEADER ) {	// we do not need to lock here since we double check the state below
 		timespec_get( &timeout, TIME_UTC );
 		timespec_add_ms( timeout, ( ELECTION_TIMEOUT * 2 ) );
-
 		pthread_mutex_lock( &follower_lock );
 		pthread_cond_timedwait( &follower_cond, &follower_lock, &timeout );
 		pthread_mutex_unlock( &follower_lock );
@@ -2394,7 +2397,9 @@ void rft_shutdown( ) {
 			if( server != NULL ) {
 				redisContext *c = redis_sync_init( binfo->redis.host, binfo->redis.port );
 				if( c != NULL ) {
-					if( ! redis_sync_safe_ep_del( c, binfo->redis.key, server->target ) ) {
+					if( redis_sync_safe_ep_del( c, binfo->redis.key, server->target ) ) {
+						logger_info( "send message to routing manager ===== DELETE all RFT routes =====" );
+					} else {
 						logger_error( "unable to delete bootstrap key '%s' from Redis server", binfo->redis.key );
 					}
 
@@ -2415,4 +2420,6 @@ void rft_shutdown( ) {
 	pthread_cond_signal( &follower_cond );	// check ther order of follower and leader
 	pthread_cond_signal( &replica_cond );
 	pthread_cond_broadcast( &leader_cond );
+
+	free( binfo );
 }
